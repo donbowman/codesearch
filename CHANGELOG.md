@@ -24,6 +24,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **`find_impact` surfaces partial results.** Index warnings — non-compiling C# projects, swallowed reference-resolution exceptions, `scip-typescript` non-zero exits with usable output — now persist (C#: alongside the cached refs in the same transaction; TS: in the index meta) and ride the answer as an additive `warnings` array instead of vanishing into the log, so consumers such as the `audit` binary's `impact`/`removals` never read incomplete evidence as zero (todo #139).
 
+- **Claude Code web-guard hook is topic/mount-scoped.** Only queries about the mounted products reach the web guard, and the retry cache is keyed per mount.
+
 ### Fixed
 
 - **Persisted helper-exit warnings are platform-stable — Linux CI green again.** `ExitStatus`'s `Display` renders `exit code: N` on Windows but `exit status: N` on Unix, so the non-zero-exit warning the TypeScript symbol indexer persists into its meta table disagreed with its own regression test on Linux, failing `test-linux`/`csharp-integration-tests` deterministically since #238. A shared `exit_status_text()` renders `exit code: N` on every platform (signal-terminated processes fall back to the platform string), applied to the persisted TS warning and the C#/TS helper log lines, pinned by a cross-platform unit test.
