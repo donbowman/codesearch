@@ -36,8 +36,16 @@ pub struct SymbolReference {
 /// Result of a `find_impact` query.
 #[derive(Debug, Clone, Serialize)]
 pub struct FindImpactResult {
-    /// Canonical SCIP symbol string, e.g. `csharp . . . FieldDefinition#Validate().`
+    /// The query as asked — a symbol name, `file:line`, or explicit key.
     pub symbol: String,
+    /// The canonical SCIP key actually selected, e.g.
+    /// `csharp . . . FieldDefinition#Validate().` Present only when the
+    /// query resolved to exactly one stored symbol; absent on an ambiguous
+    /// answer (a separate envelope) or when nothing matched. The selector
+    /// the issue-specified contract turns on: echo is `symbol`, identity
+    /// is this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_symbol: Option<String>,
     /// Resolved references.
     pub references: Vec<SymbolReference>,
     /// Seconds since the symbol index was last rebuilt.
@@ -57,6 +65,58 @@ pub struct FindImpactResult {
     /// never fail the response).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_head_sha: Option<String>,
+}
+
+/// A `find_impact` query in the form the adapters resolve it.
+///
+/// The three input variants of `FindImpactRequest` map onto this one-to-one;
+/// `ExactKey` is the explicit selection a caller makes after an ambiguous
+/// answer (or with any full key it already has).
+#[derive(Debug, Clone)]
+pub enum ImpactQuery {
+    /// Look up this exact canonical SCIP key. No fuzzy fallback: a key
+    /// that is not in the index is a `KeyMatch::NotFound`, never a guess.
+    ExactKey(String),
+    /// Resolve a possibly-fuzzy symbol name (e.g. `Validate`,
+    /// `FieldDefinition.Validate`) to one canonical key.
+    Name(String),
+    /// Resolve the symbol defined at a file position (1-based line).
+    Position { file: PathBuf, line: u32 },
+}
+
+/// Outcome of resolving an [`ImpactQuery`] against the index.
+///
+/// Resolution is a plain LMDB read — fast, never invoking the SCIP
+/// helper. Ambiguity is surfaced instead of silently picking the
+/// shortest candidate (the pre-fix behaviour hid overloads this way).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyMatch {
+    /// Exactly one stored symbol matches; this is the selection.
+    Resolved(String),
+    /// Several stored symbols match and the query alone cannot choose.
+    /// Candidates are sorted and deduplicated — re-query with
+    /// `ImpactQuery::ExactKey` for one of them.
+    Ambiguous(Vec<String>),
+    /// Nothing in the index matches.
+    NotFound,
+}
+
+/// Typed answer for an ambiguous `find_impact` query, serialized as JSON
+/// in the tool-result text (same convention as [`SymbolLookupBusy`]).
+///
+/// The MCP client re-calls with `symbol_key` set to one of `candidates`;
+/// the server never silently picks on the client's behalf.
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolAmbiguity {
+    /// Always `true` — machine-branchable, like `busy`.
+    pub ambiguous: bool,
+    /// The query as asked.
+    pub query: String,
+    /// Every canonical key that matches, sorted. These are exact
+    /// `symbol_key` values, not prose.
+    pub candidates: Vec<String>,
+    /// Actionable hint for the agent.
+    pub hint_for_agent: String,
 }
 
 /// Resolve the repository HEAD sha for `repo_root` (40-hex), or `None`
@@ -318,16 +378,27 @@ pub trait SymbolIndexer: Send + Sync {
         scope: RebuildScope,
     ) -> Result<RebuildSummary>;
 
-    /// Return the symbol's references from the LMDB store.
-    fn find_references(&self, db_path: &Path, symbol: &str) -> Result<Vec<SymbolReference>>;
+    /// Resolve a `find_impact` query to canonical SCIP key(s), exposing
+    /// ambiguity instead of silently choosing among candidates.
+    ///
+    /// Plain LMDB reads only — never invokes the SCIP helper, so callers
+    /// can (and the find_impact handler does) run this BEFORE the
+    /// budget-tracked reference fetch: an ambiguous answer is instant.
+    /// `KeyMatch::Resolved` is the selected canonical identity; the
+    /// historical behaviour picked the shortest fuzzy match silently,
+    /// which hid overloads from the caller.
+    fn resolve_query(&self, db_path: &Path, query: &ImpactQuery) -> Result<KeyMatch>;
 
-    /// Look up references by file-position instead of symbol name.
-    /// Resolves the position to a canonical SCIP symbol first.
-    fn find_references_by_position(
+    /// Return the symbol's references for one EXACT canonical key.
+    ///
+    /// This is the expensive half of a lookup: on the C# adapter a cold
+    /// reference cache triggers the `scip-csharp find-refs` subprocess
+    /// (minutes on a large solution), which is why the find_impact
+    /// handler budgets and tracks THIS call and not `resolve_query`.
+    fn find_references_for_key(
         &self,
         db_path: &Path,
-        file: &Path,
-        line: u32,
+        canonical_key: &str,
     ) -> Result<Vec<SymbolReference>>;
 
     /// How old is the current symbol index (seconds since last rebuild)?

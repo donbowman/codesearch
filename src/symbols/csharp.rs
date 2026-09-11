@@ -47,7 +47,10 @@ use heed::Database;
 use serde::{Deserialize, Serialize};
 
 use super::scip_parse;
-use super::{PrewarmSummary, RebuildScope, RebuildSummary, SymbolIndexer, SymbolReference};
+use super::{
+    ImpactQuery, KeyMatch, PrewarmSummary, RebuildScope, RebuildSummary, SymbolIndexer,
+    SymbolReference,
+};
 
 // ── Helper stderr routing ─────────────────────────────────────────
 
@@ -651,41 +654,51 @@ impl CSharpSymbolIndexer {
 
     // ── Internal lookup helpers ────────────────────────────────────
 
-    /// Resolve a (possibly fuzzy) symbol name to the canonical SCIP key stored
-    /// in `scip_symbols`. Returns `None` if no matching symbol is found.
-    fn resolve_canonical_key(&self, env: &TrackedEnv, symbol: &str) -> Result<Option<String>> {
+    /// Resolve a (possibly fuzzy) symbol name to canonical SCIP key(s).
+    ///
+    /// Exact key wins. Otherwise the simple-name index lists candidates and
+    /// the fuzzy filter narrows them: zero matches is `NotFound`, exactly
+    /// one resolves, and SEVERAL come back as `KeyMatch::Ambiguous` — the
+    /// caller must choose. The old behaviour silently picked the shortest
+    /// candidate, which hid overloads (`Validate()` vs `Validate(string)`)
+    /// from the caller and answered about the wrong symbol.
+    fn resolve_name_key(&self, env: &TrackedEnv, symbol: &str) -> Result<KeyMatch> {
         let rtxn = env.read_txn()?;
 
         let symbols_db: Database<Str, Bytes> = match env.open_database(&rtxn, Some(SCIP_DB_NAME))? {
             Some(db) => db,
-            None => return Ok(None),
+            None => return Ok(KeyMatch::NotFound),
         };
 
         // Exact match first
         if symbols_db.get(&rtxn, symbol)?.is_some() {
-            return Ok(Some(symbol.to_string()));
+            return Ok(KeyMatch::Resolved(symbol.to_string()));
         }
 
         // Fuzzy via simple-name index
         let simple_names_db: Database<Str, Bytes> =
             match env.open_database(&rtxn, Some(SCIP_SIMPLE_NAMES_DB_NAME))? {
                 Some(db) => db,
-                None => return Ok(None),
+                None => return Ok(KeyMatch::NotFound),
             };
 
         let simple = extract_simple_name(symbol);
         let candidates: Vec<String> = match simple_names_db.get(&rtxn, &simple as &str)? {
             Some(b) => deserialize_keys_v1(b)?,
-            None => return Ok(None),
+            None => return Ok(KeyMatch::NotFound),
         };
 
-        let chosen = candidates
-            .iter()
+        let mut matches: Vec<String> = candidates
+            .into_iter()
             .filter(|k| fuzzy_symbol_match(symbol, k))
-            .min_by_key(|k| k.len())
-            .cloned();
-
-        Ok(chosen)
+            .collect();
+        matches.sort();
+        matches.dedup();
+        Ok(match matches.len() {
+            0 => KeyMatch::NotFound,
+            1 => KeyMatch::Resolved(matches.pop().expect("len checked")),
+            _ => KeyMatch::Ambiguous(matches),
+        })
     }
 
     /// Inner implementation: fetch references for an EXACT (canonical) symbol key.
@@ -1585,55 +1598,66 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         })
     }
 
-    fn find_references(&self, db_path: &Path, symbol: &str) -> Result<Vec<SymbolReference>> {
-        // Resolve to canonical key, then delegate. The env handle is the
-        // process-shared one; this scope just bounds how long we hold a
-        // reference — concurrent opens are impossible by construction.
-        let canonical = {
-            let env = self.open_scip_env(db_path)?;
-            match self.resolve_canonical_key(&env, symbol)? {
-                Some(k) => k,
-                None => {
-                    tracing::debug!("Symbol '{}' not found in index", symbol);
-                    return Ok(vec![]);
-                }
+    fn resolve_query(&self, db_path: &Path, query: &ImpactQuery) -> Result<KeyMatch> {
+        match query {
+            ImpactQuery::ExactKey(key) => {
+                // Explicit selection: presence check only, no fuzzy
+                // fallback. A key that is not in the index is NotFound —
+                // the handler turns that into a loud failure, never a
+                // guess at a near-miss symbol.
+                let env = self.open_scip_env(db_path)?;
+                let rtxn = env.read_txn()?;
+                let present = match env.open_database::<Str, Bytes>(&rtxn, Some(SCIP_DB_NAME))? {
+                    Some(db) => db.get(&rtxn, key as &str)?.is_some(),
+                    None => false,
+                };
+                Ok(if present {
+                    KeyMatch::Resolved(key.clone())
+                } else {
+                    KeyMatch::NotFound
+                })
             }
-            // env dropped here
-        };
+            ImpactQuery::Name(name) => {
+                let env = self.open_scip_env(db_path)?;
+                self.resolve_name_key(&env, name)
+            }
+            ImpactQuery::Position { file, line } => {
+                let env = self.open_scip_env(db_path)?;
+                let rtxn = env.read_txn()?;
 
-        self.find_refs_for_canonical_key(db_path, &canonical)
+                let positions_db: Database<Str, Bytes> = env
+                    .open_database(&rtxn, Some(SCIP_POSITION_DB_NAME))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Position index not found. Run a rebuild first.")
+                    })?;
+
+                // Normalize file path to forward-slash (Windows compat)
+                let pos_key = format!("{}:{}", file.to_string_lossy().replace('\\', "/"), line);
+
+                let mut candidates: Vec<String> = match positions_db.get(&rtxn, &pos_key as &str)? {
+                    Some(b) => deserialize_keys_v1(b)?,
+                    None => return Ok(KeyMatch::NotFound),
+                };
+                candidates.sort();
+                candidates.dedup();
+
+                // Several symbols on one line (overloads, partial spans)
+                // are ambiguity, not a licence to pick the shortest.
+                Ok(match candidates.len() {
+                    0 => KeyMatch::NotFound,
+                    1 => KeyMatch::Resolved(candidates.pop().expect("len checked")),
+                    _ => KeyMatch::Ambiguous(candidates),
+                })
+            }
+        }
     }
 
-    fn find_references_by_position(
+    fn find_references_for_key(
         &self,
         db_path: &Path,
-        file: &Path,
-        line: u32,
+        canonical_key: &str,
     ) -> Result<Vec<SymbolReference>> {
-        let env = self.open_scip_env(db_path)?;
-        let rtxn = env.read_txn()?;
-
-        let positions_db: Database<Str, Bytes> = env
-            .open_database(&rtxn, Some(SCIP_POSITION_DB_NAME))?
-            .ok_or_else(|| anyhow::anyhow!("Position index not found. Run a rebuild first."))?;
-
-        // Normalize file path to forward-slash (Windows compat)
-        let pos_key = format!("{}:{}", file.to_string_lossy().replace('\\', "/"), line);
-
-        let candidate_keys: Vec<String> = match positions_db.get(&rtxn, &pos_key as &str)? {
-            Some(b) => deserialize_keys_v1(b)?,
-            None => return Ok(vec![]),
-        };
-
-        // Pick shortest (most specific) symbol defined at this position
-        let chosen = candidate_keys.iter().min_by_key(|k| k.len()).cloned();
-        drop(rtxn);
-        drop(env); // release this reference before delegation; the shared env may stay alive
-
-        match chosen {
-            Some(k) => self.find_refs_for_canonical_key(db_path, &k),
-            None => Ok(vec![]),
-        }
+        self.find_refs_for_canonical_key(db_path, canonical_key)
     }
 
     fn index_age(&self, db_path: &Path) -> u64 {
@@ -1805,5 +1829,188 @@ mod tests {
             "UnrelatedName",
             "csharp App . FieldDefinition#Validate()."
         ));
+    }
+
+    // ── resolve_query semantics (hand-populated LMDB — no helper) ──
+
+    /// Two `Validate` overloads share a simple name, `Compute` is unique.
+    /// Writes scip_symbols / scip_simple_names / scip_positions directly.
+    fn populate_ambiguity_fixture(db_path: &Path) -> (String, String, String) {
+        let env = crate::symbols::get_shared_scip_env(db_path).expect("shared env");
+        let mut wtxn = env.write_txn().expect("wtxn");
+
+        let validate1 = "csharp Ns . V#Validate().".to_string();
+        let validate2 = "csharp Ns . V#Validate(System.String).".to_string();
+        let compute = "csharp Ns . C#Compute().".to_string();
+
+        let symbols: Database<Str, Bytes> = env
+            .open_database(&wtxn, Some(SCIP_DB_NAME))
+            .unwrap()
+            .unwrap();
+        for key in [&validate1, &validate2, &compute] {
+            let refs = serialize_refs(&[StoredReference {
+                file: PathBuf::from("src/v.cs"),
+                start_line: 1,
+                end_line: 1,
+                kind: "definition".into(),
+            }])
+            .unwrap();
+            symbols.put(&mut wtxn, key.as_str(), &refs).unwrap();
+        }
+
+        let names: Database<Str, Bytes> = env
+            .open_database(&wtxn, Some(SCIP_SIMPLE_NAMES_DB_NAME))
+            .unwrap()
+            .unwrap();
+        // Stored deliberately out of order: resolution must sort.
+        names
+            .put(
+                &mut wtxn,
+                "Validate",
+                &serialize_keys_v1(&[validate2.clone(), validate1.clone()]).unwrap(),
+            )
+            .unwrap();
+        names
+            .put(
+                &mut wtxn,
+                "Compute",
+                &serialize_keys_v1(std::slice::from_ref(&compute)).unwrap(),
+            )
+            .unwrap();
+
+        let positions: Database<Str, Bytes> = env
+            .open_database(&wtxn, Some(SCIP_POSITION_DB_NAME))
+            .unwrap()
+            .unwrap();
+        positions
+            .put(
+                &mut wtxn,
+                "src/v.cs:10",
+                &serialize_keys_v1(&[validate1.clone(), validate2.clone()]).unwrap(),
+            )
+            .unwrap();
+        positions
+            .put(
+                &mut wtxn,
+                "src/v.cs:20",
+                &serialize_keys_v1(std::slice::from_ref(&compute)).unwrap(),
+            )
+            .unwrap();
+
+        wtxn.commit().unwrap();
+        (validate1, validate2, compute)
+    }
+
+    #[test]
+    fn resolve_name_unique_fuzzy_resolves_the_single_candidate() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("db");
+        let (_v1, _v2, compute) = populate_ambiguity_fixture(&db);
+        let indexer = CSharpSymbolIndexer::new();
+        assert_eq!(
+            indexer
+                .resolve_query(&db, &ImpactQuery::Name("Compute".into()))
+                .unwrap(),
+            KeyMatch::Resolved(compute)
+        );
+    }
+
+    #[test]
+    fn resolve_name_overloads_come_back_ambiguous_and_sorted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("db");
+        let (v1, v2, _compute) = populate_ambiguity_fixture(&db);
+        let indexer = CSharpSymbolIndexer::new();
+        let m = indexer
+            .resolve_query(&db, &ImpactQuery::Name("Validate".into()))
+            .unwrap();
+        // The pre-fix behaviour silently picked the shortest key here and
+        // answered about the wrong overload.
+        assert_eq!(m, KeyMatch::Ambiguous(vec![v1, v2]));
+    }
+
+    #[test]
+    fn resolve_exact_key_is_verbatim_and_never_fuzzy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("db");
+        let (v1, _v2, _compute) = populate_ambiguity_fixture(&db);
+        let indexer = CSharpSymbolIndexer::new();
+        assert_eq!(
+            indexer
+                .resolve_query(&db, &ImpactQuery::ExactKey(v1.clone()))
+                .unwrap(),
+            KeyMatch::Resolved(v1)
+        );
+        // A key that is only a fuzzy neighbour of a stored one must miss.
+        assert_eq!(
+            indexer
+                .resolve_query(&db, &ImpactQuery::ExactKey("csharp Ns . V#Validate".into()))
+                .unwrap(),
+            KeyMatch::NotFound
+        );
+    }
+
+    #[test]
+    fn resolve_position_single_resolves_two_symbols_are_ambiguous() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("db");
+        let (v1, v2, compute) = populate_ambiguity_fixture(&db);
+        let indexer = CSharpSymbolIndexer::new();
+
+        // One symbol on the line → resolves.
+        assert_eq!(
+            indexer
+                .resolve_query(
+                    &db,
+                    &ImpactQuery::Position {
+                        file: PathBuf::from("src/v.cs"),
+                        line: 20
+                    }
+                )
+                .unwrap(),
+            KeyMatch::Resolved(compute)
+        );
+
+        // Two overloads on the same line → ambiguity, never a shortest pick.
+        assert_eq!(
+            indexer
+                .resolve_query(
+                    &db,
+                    &ImpactQuery::Position {
+                        file: PathBuf::from("src/v.cs"),
+                        line: 10
+                    }
+                )
+                .unwrap(),
+            KeyMatch::Ambiguous(vec![v1, v2])
+        );
+
+        // Nothing defined there → NotFound.
+        assert_eq!(
+            indexer
+                .resolve_query(
+                    &db,
+                    &ImpactQuery::Position {
+                        file: PathBuf::from("src/v.cs"),
+                        line: 99
+                    }
+                )
+                .unwrap(),
+            KeyMatch::NotFound
+        );
+    }
+
+    #[test]
+    fn references_for_key_returns_stored_definitions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("db");
+        let (v1, _v2, _compute) = populate_ambiguity_fixture(&db);
+        let indexer = CSharpSymbolIndexer::new();
+        // Safe without the helper: the fixture stores definitions, and both
+        // the no-helper and no-.sln lazy paths short-circuit to definitions.
+        let refs = indexer.find_references_for_key(&db, &v1).unwrap();
+        assert_eq!(refs.len(), 1, "definitions only, got {refs:?}");
+        assert_eq!(refs[0].kind, "definition");
+        assert_eq!(refs[0].file, PathBuf::from("src/v.cs"));
     }
 }

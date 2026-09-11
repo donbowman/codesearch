@@ -10,8 +10,8 @@
 //! `scip-typescript` emits full occurrences (definitions AND references) in a
 //! single indexing pass. Unlike the C# adapter (`csharp.rs`), there is no lazy
 //! `find-refs` subprocess and no `scip_ref_cache` table: `rebuild()` populates
-//! `scip_symbols` with everything up front, and `find_references()` /
-//! `find_references_by_position()` only ever read LMDB.
+//! `scip_symbols` with everything up front, and `resolve_query()` /
+//! `find_references_for_key()` only ever read LMDB.
 //!
 //! ## Incremental rebuild
 //!
@@ -30,7 +30,7 @@ use heed::Database;
 use serde::{Deserialize, Serialize};
 
 use super::scip_proto;
-use super::{RebuildScope, RebuildSummary, SymbolIndexer, SymbolReference};
+use super::{ImpactQuery, KeyMatch, RebuildScope, RebuildSummary, SymbolIndexer, SymbolReference};
 
 use crate::constants::{
     LANG_TYPESCRIPT, SCIP_POSITION_DB_NAME, SCIP_SIMPLE_NAMES_DB_NAME, SCIP_SYMBOLS_DB_NAME,
@@ -356,39 +356,47 @@ impl TypeScriptSymbolIndexer {
         Ok(())
     }
 
-    /// Resolve a user-supplied symbol query to a canonical SCIP symbol key.
+    /// Resolve a user-supplied symbol query to canonical SCIP key(s).
     /// Exact match first, then fuzzy match via the simple-name index.
-    fn resolve_canonical_key(&self, env: &TrackedEnv, symbol: &str) -> Result<Option<String>> {
+    ///
+    /// Several fuzzy matches come back as `KeyMatch::Ambiguous` — the old
+    /// behaviour silently picked the shortest candidate, which hid
+    /// overloads from the caller.
+    fn resolve_name_key(&self, env: &TrackedEnv, symbol: &str) -> Result<KeyMatch> {
         let rtxn = env.read_txn()?;
 
         let symbols_db: Database<Str, Bytes> = match env.open_database(&rtxn, Some(SCIP_DB_NAME))? {
             Some(db) => db,
-            None => return Ok(None),
+            None => return Ok(KeyMatch::NotFound),
         };
 
         if symbols_db.get(&rtxn, symbol)?.is_some() {
-            return Ok(Some(symbol.to_string()));
+            return Ok(KeyMatch::Resolved(symbol.to_string()));
         }
 
         let simple_names_db: Database<Str, Bytes> =
             match env.open_database(&rtxn, Some(SCIP_NAMES_DB_NAME))? {
                 Some(db) => db,
-                None => return Ok(None),
+                None => return Ok(KeyMatch::NotFound),
             };
 
         let simple = extract_simple_name(symbol);
         let candidates: Vec<String> = match simple_names_db.get(&rtxn, &simple as &str)? {
             Some(b) => deserialize_keys_v1(b)?,
-            None => return Ok(None),
+            None => return Ok(KeyMatch::NotFound),
         };
 
-        let chosen = candidates
-            .iter()
+        let mut matches: Vec<String> = candidates
+            .into_iter()
             .filter(|k| fuzzy_symbol_match(symbol, k))
-            .min_by_key(|k| k.len())
-            .cloned();
-
-        Ok(chosen)
+            .collect();
+        matches.sort();
+        matches.dedup();
+        Ok(match matches.len() {
+            0 => KeyMatch::NotFound,
+            1 => KeyMatch::Resolved(matches.pop().expect("len checked")),
+            _ => KeyMatch::Ambiguous(matches),
+        })
     }
 }
 
@@ -585,16 +593,65 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
         })
     }
 
-    fn find_references(&self, db_path: &Path, symbol: &str) -> Result<Vec<SymbolReference>> {
-        let env = self.open_scip_env(db_path)?;
-
-        let canonical = match self.resolve_canonical_key(&env, symbol)? {
-            Some(k) => k,
-            None => {
-                tracing::debug!("Symbol '{}' not found in TypeScript index", symbol);
-                return Ok(vec![]);
+    fn resolve_query(&self, db_path: &Path, query: &ImpactQuery) -> Result<KeyMatch> {
+        match query {
+            ImpactQuery::ExactKey(key) => {
+                // Explicit selection: presence check only, no fuzzy
+                // fallback. A key that is not in the index is NotFound —
+                // the handler turns that into a loud failure, never a
+                // guess at a near-miss symbol.
+                let env = self.open_scip_env(db_path)?;
+                let rtxn = env.read_txn()?;
+                let present = match env.open_database::<Str, Bytes>(&rtxn, Some(SCIP_DB_NAME))? {
+                    Some(db) => db.get(&rtxn, key as &str)?.is_some(),
+                    None => false,
+                };
+                Ok(if present {
+                    KeyMatch::Resolved(key.clone())
+                } else {
+                    KeyMatch::NotFound
+                })
             }
-        };
+            ImpactQuery::Name(name) => {
+                let env = self.open_scip_env(db_path)?;
+                self.resolve_name_key(&env, name)
+            }
+            ImpactQuery::Position { file, line } => {
+                let env = self.open_scip_env(db_path)?;
+                let rtxn = env.read_txn()?;
+
+                let positions_db: Database<Str, Bytes> = env
+                    .open_database(&rtxn, Some(SCIP_POS_DB_NAME))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Position index not found. Run a rebuild first.")
+                    })?;
+
+                let pos_key = format!("{}:{}", file.to_string_lossy().replace('\\', "/"), line);
+
+                let mut candidates: Vec<String> = match positions_db.get(&rtxn, &pos_key as &str)? {
+                    Some(b) => deserialize_keys_v1(b)?,
+                    None => return Ok(KeyMatch::NotFound),
+                };
+                candidates.sort();
+                candidates.dedup();
+
+                // Several symbols on one line are ambiguity, not a licence
+                // to pick the shortest.
+                Ok(match candidates.len() {
+                    0 => KeyMatch::NotFound,
+                    1 => KeyMatch::Resolved(candidates.pop().expect("len checked")),
+                    _ => KeyMatch::Ambiguous(candidates),
+                })
+            }
+        }
+    }
+
+    fn find_references_for_key(
+        &self,
+        db_path: &Path,
+        canonical_key: &str,
+    ) -> Result<Vec<SymbolReference>> {
+        let env = self.open_scip_env(db_path)?;
 
         let rtxn = env.read_txn()?;
         let symbols_db: Database<Str, Bytes> = match env.open_database(&rtxn, Some(SCIP_DB_NAME))? {
@@ -602,7 +659,7 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
             None => return Ok(vec![]),
         };
 
-        let stored = match symbols_db.get(&rtxn, &canonical)? {
+        let stored = match symbols_db.get(&rtxn, canonical_key)? {
             Some(bytes) => deserialize_refs(bytes)?,
             None => return Ok(vec![]),
         };
@@ -616,36 +673,6 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
                 kind: r.kind,
             })
             .collect())
-    }
-
-    fn find_references_by_position(
-        &self,
-        db_path: &Path,
-        file: &Path,
-        line: u32,
-    ) -> Result<Vec<SymbolReference>> {
-        let env = self.open_scip_env(db_path)?;
-        let rtxn = env.read_txn()?;
-
-        let positions_db: Database<Str, Bytes> = env
-            .open_database(&rtxn, Some(SCIP_POS_DB_NAME))?
-            .ok_or_else(|| anyhow::anyhow!("Position index not found. Run a rebuild first."))?;
-
-        let pos_key = format!("{}:{}", file.to_string_lossy().replace('\\', "/"), line);
-
-        let candidate_keys: Vec<String> = match positions_db.get(&rtxn, &pos_key as &str)? {
-            Some(b) => deserialize_keys_v1(b)?,
-            None => return Ok(vec![]),
-        };
-
-        let chosen = candidate_keys.iter().min_by_key(|k| k.len()).cloned();
-        drop(rtxn);
-        drop(env);
-
-        match chosen {
-            Some(k) => self.find_references(db_path, &k),
-            None => Ok(vec![]),
-        }
     }
 
     fn index_age(&self, db_path: &Path) -> u64 {
@@ -780,3 +807,9 @@ mod tests {
         // `tmp` dropped at end of scope → dir removed even on panic.
     }
 }
+
+/// Ambiguity-resolution tests for `resolve_query` (hand-populated LMDB —
+/// no helper). Sibling `_tests.rs` file per repo convention.
+#[cfg(test)]
+#[path = "typescript_tests.rs"]
+mod typescript_tests;

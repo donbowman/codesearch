@@ -235,9 +235,12 @@ fn failure_hints_are_actionable_per_class() {
 #[test]
 fn fingerprint_fields_present_when_set_and_omitted_when_none() {
     use crate::symbols::SymbolReference;
-    let base = |index_head_sha: Option<String>, current_head_sha: Option<String>| {
+    let base = |resolved_symbol: Option<String>,
+                index_head_sha: Option<String>,
+                current_head_sha: Option<String>| {
         crate::symbols::FindImpactResult {
-            symbol: "csharp Ns.T.M()".to_string(),
+            symbol: "FieldDefinition.Validate".to_string(),
+            resolved_symbol,
             references: vec![SymbolReference {
                 file: PathBuf::from("a.cs"),
                 start_line: 1,
@@ -251,14 +254,23 @@ fn fingerprint_fields_present_when_set_and_omitted_when_none() {
             current_head_sha,
         }
     };
-    let both: serde_json::Value =
-        serde_json::to_value(base(Some("a".repeat(40)), Some("b".repeat(40)))).unwrap();
-    assert_eq!(both["index_head_sha"], "a".repeat(40));
-    assert_eq!(both["current_head_sha"], "b".repeat(40));
+    let all: serde_json::Value = serde_json::to_value(base(
+        Some("csharp Ns . FieldDefinition#Validate().".to_string()),
+        Some("a".repeat(40)),
+        Some("b".repeat(40)),
+    ))
+    .unwrap();
+    assert_eq!(all["index_head_sha"], "a".repeat(40));
+    assert_eq!(all["current_head_sha"], "b".repeat(40));
+    assert_eq!(
+        all["resolved_symbol"], "csharp Ns . FieldDefinition#Validate().",
+        "a resolved answer must name the selected canonical identity"
+    );
 
-    // None must OMIT the key, not serialize null — old consumers see an
-    // unchanged shape when the fingerprint is unknown.
-    let neither: serde_json::Value = serde_json::to_value(base(None, None)).unwrap();
+    // None must OMIT the keys, not serialize null — old consumers see an
+    // unchanged shape when the identity/fingerprint is unknown (ambiguous
+    // and not-found answers travel in their own envelopes).
+    let neither: serde_json::Value = serde_json::to_value(base(None, None, None)).unwrap();
     let keys: Vec<&str> = neither
         .as_object()
         .unwrap()
@@ -267,6 +279,133 @@ fn fingerprint_fields_present_when_set_and_omitted_when_none() {
         .collect();
     assert!(!keys.contains(&"index_head_sha"), "keys: {keys:?}");
     assert!(!keys.contains(&"current_head_sha"), "keys: {keys:?}");
+    assert!(!keys.contains(&"resolved_symbol"), "keys: {keys:?}");
+}
+
+#[test]
+fn ambiguity_envelope_serializes_the_four_documented_fields() {
+    let ambiguity = crate::symbols::SymbolAmbiguity {
+        ambiguous: true,
+        query: "'Validate'".to_string(),
+        candidates: vec![
+            "csharp Ns . V#Validate().".to_string(),
+            "csharp Ns . V#Validate(System.String).".to_string(),
+        ],
+        hint_for_agent: "re-call with symbol_key".to_string(),
+    };
+    let json: serde_json::Value = serde_json::to_value(&ambiguity).unwrap();
+    assert_eq!(json["ambiguous"], serde_json::Value::Bool(true));
+    assert_eq!(json["query"], "'Validate'");
+    assert_eq!(json["candidates"].as_array().unwrap().len(), 2);
+    assert!(!json["hint_for_agent"].as_str().unwrap().is_empty());
+    // Exactly the documented envelope shape — the four fields, no extras.
+    let mut keys: Vec<&str> = json
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["ambiguous", "candidates", "hint_for_agent", "query"]
+    );
+}
+
+// ── Handler-arm tests: the resolution contract through the tool method ──
+//
+// The adapter layer pins KeyMatch semantics; these pin the arms a caller
+// actually sees: Ambiguous → typed candidates envelope, explicit-key miss
+// → loud failure (never the empty answer), fuzzy NotFound → the
+// historical empty-references contract, and the symbol_key combination
+// rejection. All early-return before the budget race, so no busy paths
+// are in play.
+
+use super::CodesearchService;
+use crate::mcp::types::FindImpactRequest;
+use rmcp::handler::server::wrapper::Parameters;
+
+async fn tool_text(service: &CodesearchService, req: FindImpactRequest) -> String {
+    let result = service
+        .find_impact(Parameters(req))
+        .await
+        .expect("tool result");
+    result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .expect("text content")
+        .text
+        .clone()
+}
+
+fn find_impact_request() -> FindImpactRequest {
+    FindImpactRequest {
+        symbol_name: None,
+        file: None,
+        line: None,
+        symbol_key: None,
+        language: Some("csharp".to_string()),
+        project: None,
+        group: None,
+    }
+}
+
+/// A service whose db is a valid-but-empty index at `<root>/.codesearch.db`.
+fn build_service() -> (CodesearchService, tempfile::TempDir) {
+    let root = tempfile::tempdir().expect("tempdir");
+    let db = root.path().join(".codesearch.db");
+    std::fs::create_dir_all(&db).expect("db dir");
+    std::fs::write(
+        db.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .expect("metadata");
+    let stores =
+        std::sync::Arc::new(crate::index::SharedStores::new(&db, 2).expect("shared stores"));
+    let service = CodesearchService::new_with_stores(Some(root.path().to_path_buf()), Some(stores))
+        .expect("service");
+    (service, root)
+}
+
+/// Two `Validate` overloads in scip_symbols + the simple-name index —
+/// enough for every resolution arm (only key-presence is read).
+fn populate_overload_fixture(db_path: &std::path::Path) {
+    let env = crate::symbols::get_shared_scip_env(db_path).expect("shared env");
+    let mut wtxn = env.write_txn().expect("wtxn");
+    let v1 = "csharp Ns . V#Validate().".to_string();
+    let v2 = "csharp Ns . V#Validate(System.String).".to_string();
+    let symbols: heed::Database<heed::types::Str, heed::types::Bytes> = env
+        .open_database(&wtxn, Some(crate::constants::SCIP_SYMBOLS_DB_NAME))
+        .unwrap()
+        .unwrap();
+    for key in [&v1, &v2] {
+        symbols.put(&mut wtxn, key.as_str(), &[1u8]).unwrap();
+    }
+    let names: heed::Database<heed::types::Str, heed::types::Bytes> = env
+        .open_database(&wtxn, Some(crate::constants::SCIP_SIMPLE_NAMES_DB_NAME))
+        .unwrap()
+        .unwrap();
+    let mut payload = vec![1u8];
+    payload.extend_from_slice(&bincode::serialize(&vec![v1.clone(), v2.clone()]).unwrap());
+    names.put(&mut wtxn, "Validate", &payload).unwrap();
+    wtxn.commit().unwrap();
+}
+
+/// The C# indexer must pass the `is_available` gate deterministically:
+/// a dummy file with the expected helper filename, wired via the env
+/// override (serialised — env mutation, per the repo rule).
+fn make_helper_available(root: &tempfile::TempDir) -> crate::testing::EnvRestore {
+    let helper = root.path().join(if cfg!(windows) {
+        "scip-csharp.exe"
+    } else {
+        "scip-csharp"
+    });
+    std::fs::write(&helper, b"dummy").expect("dummy helper file");
+    crate::testing::EnvRestore::set(&[(
+        crate::constants::SCIP_CSHARP_HELPER_ENV,
+        helper.to_string_lossy().as_ref(),
+    )])
 }
 
 #[test]
@@ -337,4 +476,113 @@ fn dedupe_references_collapses_identical_entries_and_keeps_distinct_ones() {
 
     // Empty input stays empty (no panic on the with_capacity path).
     assert!(super::dedupe_references(Vec::new()).is_empty());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn ambiguous_name_answers_with_the_typed_candidates_envelope() {
+    let helper_root = tempfile::tempdir().unwrap();
+    let _guard = make_helper_available(&helper_root);
+    let (service, project) = build_service();
+    populate_overload_fixture(&project.path().join(".codesearch.db"));
+
+    let out = tool_text(
+        &service,
+        FindImpactRequest {
+            symbol_name: Some("Validate".to_string()),
+            ..find_impact_request()
+        },
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["ambiguous"],
+        serde_json::Value::Bool(true),
+        "an overloaded name must answer the ambiguity envelope, got: {out}"
+    );
+    let candidates = v["candidates"].as_array().expect("candidates array");
+    assert_eq!(candidates.len(), 2, "both overloads listed: {v}");
+    assert!(
+        candidates[0].as_str().unwrap() <= candidates[1].as_str().unwrap(),
+        "candidates must be sorted: {v}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn an_explicit_key_that_misses_is_a_loud_failure_not_an_empty_answer() {
+    let helper_root = tempfile::tempdir().unwrap();
+    let _guard = make_helper_available(&helper_root);
+    let (service, project) = build_service();
+    populate_overload_fixture(&project.path().join(".codesearch.db"));
+
+    let out = tool_text(
+        &service,
+        FindImpactRequest {
+            symbol_key: Some("csharp Ns . V#Gone().".to_string()),
+            ..find_impact_request()
+        },
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["class"], "failed",
+        "an explicit-key miss must be a typed failure, got: {out}"
+    );
+    assert!(
+        v["error"].as_str().unwrap().contains("not in the"),
+        "the error must name the miss: {out}"
+    );
+    assert!(
+        v.get("ambiguous").is_none(),
+        "a key miss is not ambiguity: {out}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn fuzzy_not_found_keeps_the_empty_references_contract() {
+    let helper_root = tempfile::tempdir().unwrap();
+    let _guard = make_helper_available(&helper_root);
+    let (service, project) = build_service();
+    populate_overload_fixture(&project.path().join(".codesearch.db"));
+
+    let out = tool_text(
+        &service,
+        FindImpactRequest {
+            symbol_name: Some("Nope".to_string()),
+            ..find_impact_request()
+        },
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["references"],
+        serde_json::json!([]),
+        "the historical empty-references contract: {out}"
+    );
+    assert_eq!(v["symbol"], "Nope", "the echo stays the query");
+    assert!(
+        v.get("resolved_symbol").is_none(),
+        "an unresolved answer names no identity: {out}"
+    );
+}
+
+#[tokio::test]
+async fn symbol_key_combined_with_a_fuzzy_query_is_rejected() {
+    // Validation precedes every lookup, so no helper env is needed.
+    let (service, _project) = build_service();
+    let out = tool_text(
+        &service,
+        FindImpactRequest {
+            symbol_key: Some("csharp Ns . V#Validate().".to_string()),
+            symbol_name: Some("Validate".to_string()),
+            ..find_impact_request()
+        },
+    )
+    .await;
+    assert!(
+        out.contains("mutually exclusive"),
+        "the combination must be rejected with the documented usage error: {out}"
+    );
 }

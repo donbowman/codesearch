@@ -139,10 +139,13 @@ pub struct StatusRequest {
 /// Input variants:
 /// - By name: `{ "symbol_name": "FieldDefinition.Validate", "project": "myrepo" }`
 /// - By position: `{ "file": "src/Validation/FieldDefinition.cs", "line": 42, "project": "myrepo" }`
+/// - By exact key (explicit selection after an ambiguous answer):
+///   `{ "symbol_key": "csharp . . . FieldDefinition#Validate().", "project": "myrepo" }`
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct FindImpactRequest {
     /// Symbol name to look up (e.g. `"FieldDefinition.Validate"`).
-    /// Used when you know the name. Mutually exclusive with `file`+`line`.
+    /// Mutually exclusive with `symbol_key`; if both a name and
+    /// file+line arrive, the name wins (documented precedence).
     pub symbol_name: Option<String>,
 
     /// File path for position-based lookup (relative to project root or absolute).
@@ -152,6 +155,14 @@ pub struct FindImpactRequest {
     /// 1-based line number for position-based lookup.
     /// Must be combined with `file`.
     pub line: Option<u32>,
+
+    /// Exact canonical SCIP symbol key — the explicit selection after an
+    /// ambiguous answer listed candidates (or any full key the caller
+    /// already has). Looked up verbatim: no fuzzy fallback, no silent
+    /// overload picking. Mutually exclusive with `symbol_name` and
+    /// `file`+`line`.
+    #[serde(default)]
+    pub symbol_key: Option<String>,
 
     /// Language filter (e.g. `"csharp"`). If omitted, auto-detects from file extension
     /// or searches all installed language adapters.
