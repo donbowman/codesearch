@@ -112,7 +112,7 @@ impl CodesearchService {
     /// with `symbol_key` set to exactly one candidate. Every resolved answer names the
     /// selected canonical key in `resolved_symbol`.
     #[tool(
-        description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nThe right tool for \"who calls X?\" / \"what breaks if I rename X?\". Returns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands language semantics.\n\nInput variants (mutually exclusive):\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n- By exact canonical key: `{ \"symbol_key\": \"csharp . . . FieldDefinition#Validate().\", \"project\": \"myrepo\" }`\n\nAMBIGUITY: if several stored symbols match (overloads, same-line definitions), the answer is `{\"ambiguous\": true, \"query\": ..., \"candidates\": [...]}` — pick one candidate and re-call with `symbol_key` set to it verbatim. A resolved answer names the selected canonical key in `resolved_symbol`; never assume which overload answered.\n\nPrecision backends (SCIP) ship per language; C# (bundled `scip-csharp` helper, `-with-csharp` releases) and TypeScript (via `npx` or `CODESEARCH_SCIP_TYPESCRIPT`) are available today. For Rust/Python/Go/etc., use `find` with `kind=\"usages\"` as a text-based fallback until SCIP backends for those languages ship.\n\nOn a busy answer (`\"busy\": true`): sleep `retry_after_seconds` and retry the SAME call. Busy is progress, not failure — never fall back to text search on busy.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
+        description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nThe right tool for \"who calls X?\" / \"what breaks if I rename X?\". Returns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands language semantics.\n\nInput variants (mutually exclusive):\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n- By exact canonical key: `{ \"symbol_key\": \"csharp . . . FieldDefinition#Validate().\", \"project\": \"myrepo\" }`\n\nAMBIGUITY: if several stored symbols match (overloads, same-line definitions), the answer is `{\"ambiguous\": true, \"query\": ..., \"candidates\": [...]}` — pick one candidate and re-call with `symbol_key` set to it verbatim. A resolved answer names the selected canonical key in `resolved_symbol`; never assume which overload answered.\n\nLANGUAGE: if `language` is omitted, position lookups auto-detect it from the file extension; with several SCIP helpers installed the answer asks you to name one — pass `language` to avoid the round-trip.\n\nPrecision backends (SCIP) ship per language; C# (bundled `scip-csharp` helper, `-with-csharp` releases) and TypeScript (via `npx` or `CODESEARCH_SCIP_TYPESCRIPT`) are available today. For Rust/Python/Go/etc., use `find` with `kind=\"usages\"` as a text-based fallback until SCIP backends for those languages ship.\n\nOn a busy answer (`\"busy\": true`): sleep `retry_after_seconds` and retry the SAME call. Busy is progress, not failure — never fall back to text search on busy.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
     )]
     async fn find_impact(
         &self,
@@ -206,14 +206,22 @@ impl CodesearchService {
                 }
             },
             None => {
-                // No language specified and couldn't auto-detect — try all installed
+                // No language given and none detectable from a file path.
                 let installed = registry.installed_languages();
                 if installed.is_empty() {
                     return Ok(CallToolResult::success(vec![Content::text(
                         "No symbol indexers installed. Install the `scip-csharp` helper for C# support, or `scip-typescript` (via npx) for TypeScript support.".to_string(),
                     )]));
                 }
-                // Use the first installed language (MVP: C# or TypeScript)
+                if installed.len() > 1 {
+                    // Several helpers installed: answering from one silently is
+                    // the same silent pick the ambiguity contract removes. Ask.
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Several symbol indexes are installed ({}). Pass `language` (e.g. \"csharp\") so the lookup cannot silently answer from the wrong one.",
+                        installed.join(", ")
+                    ))]));
+                }
+                // Exactly one installed: the pick is deterministic.
                 match registry.get(&installed[0]) {
                     Some(i) => i,
                     None => {
@@ -243,7 +251,7 @@ impl CodesearchService {
 
         // Perform the lookup under an internal wall-clock budget.
         //
-        // `find_references` may invoke `scip-csharp find-refs` on a cache miss
+        // `find_references_for_key` may invoke `scip-csharp find-refs` on a cache miss
         // (lazy Opt-2 reference resolution). That subprocess can take several minutes
         // on a large solution. The call therefore runs on `spawn_blocking` (it never
         // blocks an async worker thread) and is raced against

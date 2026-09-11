@@ -164,8 +164,11 @@ pub struct FindImpactRequest {
     #[serde(default)]
     pub symbol_key: Option<String>,
 
-    /// Language filter (e.g. `"csharp"`). If omitted, auto-detects from file extension
-    /// or searches all installed language adapters.
+    /// Language filter (e.g. `"csharp"`). If omitted: position lookups
+    /// auto-detect it from the file extension; with no or exactly one
+    /// installed helper the pick is deterministic, and with several
+    /// installed the answer asks you to name one instead of picking
+    /// silently.
     pub language: Option<String>,
 
     /// Route to a specific project (requires `codesearch serve`).

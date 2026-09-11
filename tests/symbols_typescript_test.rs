@@ -180,7 +180,7 @@ fn test_typescript_pipeline_ts_sample_roundtrip() {
 /// `CODESEARCH_TS_TEST_REAL` env var. Gated by the feature flag AND the env
 /// var, so it never runs in CI unless explicitly opted in.
 ///
-/// Verifies: rebuild succeeds on a non-trivial codebase, `find_references`
+/// Verifies: rebuild succeeds on a non-trivial codebase, `find_references_for_key`
 /// returns sensible multi-file results for a commonly-used symbol.
 #[test]
 #[cfg_attr(not(feature = "typescript_helper_integration"), ignore)]

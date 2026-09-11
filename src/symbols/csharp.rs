@@ -9,7 +9,7 @@
 //! `rebuild()` calls `scip-csharp index` which now emits **definitions only**
 //! (no `FindReferencesAsync` loop). This makes a full rebuild 10–50× faster.
 //!
-//! `find_references()` resolves references on demand:
+//! `find_references_for_key()` resolves references on demand:
 //! 1. Return definitions from `scip_symbols` (always populated after rebuild).
 //! 2. Check `scip_ref_cache` for previously resolved references — return if present.
 //! 3. Cache miss: invoke `scip-csharp find-refs` for the single requested symbol,

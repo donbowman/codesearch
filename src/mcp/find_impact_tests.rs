@@ -586,3 +586,95 @@ async fn symbol_key_combined_with_a_fuzzy_query_is_rejected() {
         "the combination must be rejected with the documented usage error: {out}"
     );
 }
+
+/// The TS indexer passes `is_available` via the env override the same way
+/// the C# one does — only `is_file()` is checked, so a dummy suffices.
+fn make_ts_helper_available(root: &tempfile::TempDir) -> crate::testing::EnvRestore {
+    let helper = root.path().join(if cfg!(windows) {
+        "scip-typescript.exe"
+    } else {
+        "scip-typescript"
+    });
+    std::fs::write(&helper, b"dummy").expect("dummy helper file");
+    crate::testing::EnvRestore::set(&[(
+        crate::constants::SCIP_TYPESCRIPT_HELPER_ENV,
+        helper.to_string_lossy().as_ref(),
+    )])
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn without_language_several_installed_helpers_ask_which_one() {
+    // Two helpers installed and no language: silently answering from the
+    // first would be the exact silent pick the ambiguity contract removes.
+    let csharp_root = tempfile::tempdir().unwrap();
+    let ts_root = tempfile::tempdir().unwrap();
+    let _csharp = make_helper_available(&csharp_root);
+    let _ts = make_ts_helper_available(&ts_root);
+    let (service, project) = build_service();
+    populate_overload_fixture(&project.path().join(".codesearch.db"));
+
+    let out = tool_text(
+        &service,
+        FindImpactRequest {
+            symbol_name: Some("Validate".to_string()),
+            language: None,
+            ..find_impact_request()
+        },
+    )
+    .await;
+    assert!(
+        out.contains("Several symbol indexes are installed"),
+        "the answer must ask which language, got: {out}"
+    );
+    assert!(
+        out.contains("csharp") && out.contains("typescript"),
+        "the answer must list the installed languages: {out}"
+    );
+    assert!(
+        !out.contains("\"ambiguous\""),
+        "asking for a language is not an ambiguity envelope: {out}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn without_language_a_single_installed_helper_answers_deterministically() {
+    // Exactly one installed: the pick is deterministic, so the query
+    // proceeds (here: to the ambiguity envelope from the fixture) instead
+    // of asking which language to use.
+    //
+    // The premise only holds where `scip-typescript` is NOT resolvable:
+    // the adapter falls back to `npx` on PATH, so on a Node machine TS is
+    // always installed and the single-helper scenario does not exist.
+    let lookup = if cfg!(windows) { "where" } else { "which" };
+    let npx_on_path = std::process::Command::new(lookup)
+        .arg("npx")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if npx_on_path {
+        eprintln!("skipped: npx on PATH makes TS installed, so several helpers are installed");
+        return;
+    }
+    let helper_root = tempfile::tempdir().unwrap();
+    let _guard = make_helper_available(&helper_root);
+    let (service, project) = build_service();
+    populate_overload_fixture(&project.path().join(".codesearch.db"));
+
+    let out = tool_text(
+        &service,
+        FindImpactRequest {
+            symbol_name: Some("Validate".to_string()),
+            language: None,
+            ..find_impact_request()
+        },
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["ambiguous"],
+        serde_json::Value::Bool(true),
+        "one installed helper must answer, not ask: {out}"
+    );
+}
