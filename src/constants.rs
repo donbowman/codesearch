@@ -627,6 +627,19 @@ pub const SCIP_REBUILD_TIMESTAMP_KEY: &str = "last_rebuild_ts";
 /// (never written, or git could not be read at build time).
 pub const SCIP_HEAD_SHA_KEY: &str = "head_sha";
 
+/// LMDB metadata key recording which symbol-key format generation an index
+/// was built with. Written at every C# SCIP rebuild; `has_index` refuses an
+/// index whose value is absent or differs from [`SCIP_KEY_FORMAT`], so a
+/// change to the canonical key format forces exactly one rebuild instead of
+/// old-format keys being served as fresh.
+pub const SCIP_KEY_FORMAT_KEY: &str = "key_format";
+
+/// Current value written for [`SCIP_KEY_FORMAT_KEY`]. Bump whenever the
+/// canonical SCIP symbol key format produced by a language helper changes
+/// shape (B4: C# generic arity / containing-type path / fully qualified
+/// parameter types).
+pub const SCIP_KEY_FORMAT: &str = "2";
+
 /// LMDB table mapping `(file:line)` positions to `[symbol_keys]`.
 /// Used for O(1) position-based symbol lookup.
 pub const SCIP_POSITION_DB_NAME: &str = "scip_positions";

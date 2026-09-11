@@ -16,7 +16,7 @@ use tempfile::TempDir;
 
 /// Sample JSON mimicking the output of scip-csharp for a small C# project.
 const SAMPLE_INDEX_JSON: &str = r#"{
-    "metadata": {"version": "1.0", "tool_info": "scip-csharp"},
+    "metadata": {"version": "2.0", "tool_info": "scip-csharp"},
     "documents": [
         {
             "relative_path": "src/Library/Calculator.cs",
@@ -172,7 +172,7 @@ fn test_indexer_returns_empty_when_db_missing() {
 #[test]
 fn test_parse_json_index_multiple_symbols_same_file() {
     let json = r#"{
-        "metadata": {"version": "1.0", "tool_info": "test"},
+        "metadata": {"version": "2.0", "tool_info": "test"},
         "documents": [{
             "relative_path": "src/A.cs",
             "occurrences": [
@@ -214,7 +214,7 @@ fn test_parse_json_index_multiple_symbols_same_file() {
 fn test_parse_json_index_role_fallback() {
     // When kind is empty string, should derive from symbol_roles
     let json = r#"{
-        "metadata": {"version": "1.0", "tool_info": "test"},
+        "metadata": {"version": "2.0", "tool_info": "test"},
         "documents": [{
             "relative_path": "src/A.cs",
             "occurrences": [

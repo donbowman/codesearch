@@ -128,6 +128,10 @@ const META_REBUILD_TS: &str = crate::constants::SCIP_REBUILD_TIMESTAMP_KEY;
 /// Key in the meta database storing the git HEAD sha the index was built for.
 const META_HEAD_SHA: &str = crate::constants::SCIP_HEAD_SHA_KEY;
 
+/// Key in the meta database recording the key-format generation the index was
+/// built with (see [`crate::constants::SCIP_KEY_FORMAT`]).
+const META_KEY_FORMAT: &str = crate::constants::SCIP_KEY_FORMAT_KEY;
+
 /// Key in the meta database storing the count of indexed symbols.
 #[allow(dead_code)]
 const META_SYMBOL_COUNT: &str = "symbol_count";
@@ -1647,6 +1651,13 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         if let Some(sha) = super::current_git_head(repo_path) {
             meta_db.put(&mut wtxn, META_HEAD_SHA, sha.as_str())?;
         }
+        // Unconditional: has_index refuses an index whose key-format stamp is
+        // absent or stale, so a key-format change forces exactly one rebuild.
+        meta_db.put(
+            &mut wtxn,
+            META_KEY_FORMAT,
+            crate::constants::SCIP_KEY_FORMAT,
+        )?;
 
         wtxn.commit()?;
 
@@ -1788,13 +1799,36 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         (!sha.is_empty()).then_some(sha)
     }
 
+    /// Whether a SCIP index exists AND was built with the current key format.
+    /// An index that is fresh by timestamp but stamped with another (or no)
+    /// key-format generation would serve old-shaped canonical keys as truth,
+    /// so it reports as absent and the caller rebuilds.
     fn has_index(&self, db_path: &Path) -> bool {
         let scip_dir = db_path.join("scip");
         if !scip_dir.exists() {
             return false;
         }
         // Quick check: if index_age is finite, the index exists
-        self.index_age(db_path) != u64::MAX
+        if self.index_age(db_path) == u64::MAX {
+            return false;
+        }
+        // Same env/txn/open pattern as `index_head_sha` above.
+        let env = match self.open_scip_env(db_path) {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+        let rtxn = match env.read_txn() {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        let meta_db: Option<Database<Str, Str>> = env
+            .open_database(&rtxn, Some(SCIP_META_DB_NAME))
+            .ok()
+            .flatten();
+        let stored = meta_db
+            .and_then(|db| db.get(&rtxn, META_KEY_FORMAT).ok().flatten())
+            .map(|s| s.trim().to_string());
+        stored.as_deref() == Some(crate::constants::SCIP_KEY_FORMAT)
     }
 
     fn is_available(&self) -> bool {
@@ -1912,6 +1946,53 @@ mod tests {
             "UnrelatedName",
             "csharp App . FieldDefinition#Validate()."
         ));
+    }
+
+    // ── has_index key-format gate (B4) ────────────────────────────────
+
+    /// A rebuild-stamped meta entry is what the gate reads; the fixture
+    /// hand-populates scip_meta exactly like `rebuild` does (timestamp +
+    /// key_format) instead of running a real rebuild (needs the helper).
+    #[test]
+    fn has_index_refuses_indexes_not_stamped_with_the_current_key_format() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("db");
+        let indexer = CSharpSymbolIndexer::new();
+
+        let put_meta = |key: &str, value: &str| {
+            let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+            let mut wtxn = env.write_txn().unwrap();
+            let meta: Database<Str, Str> = env
+                .open_database(&wtxn, Some(SCIP_META_DB_NAME))
+                .unwrap()
+                .unwrap();
+            meta.put(&mut wtxn, META_REBUILD_TS, "0").unwrap();
+            if !key.is_empty() {
+                meta.put(&mut wtxn, key, value).unwrap();
+            }
+            wtxn.commit().unwrap();
+        };
+
+        // Pre-B4 shape: fresh timestamp, NO key_format meta → refused.
+        put_meta("", "");
+        assert!(
+            !indexer.has_index(&db),
+            "an index without key_format meta must not count as an index"
+        );
+
+        // Current key format → accepted.
+        put_meta(META_KEY_FORMAT, crate::constants::SCIP_KEY_FORMAT);
+        assert!(
+            indexer.has_index(&db),
+            "an index stamped with the current key format must be accepted"
+        );
+
+        // A previous generation's stamp → refused again.
+        put_meta(META_KEY_FORMAT, "1");
+        assert!(
+            !indexer.has_index(&db),
+            "an index stamped with an older key format must be rebuilt, not served"
+        );
     }
 
     // ── resolve_query semantics (hand-populated LMDB — no helper) ──
@@ -2174,7 +2255,7 @@ mod tests {
         .position(|a| a == "--output")
         .and_then(|i| args.get(i + 1))
         .expect("usage: find-refs ... --output <path>");
-    let json = "{\"version\": \"1.0\", \"symbol\": \"csharp Ns . V#Validate().\", \"references\": [{\"file\": \"src/generated.cs\", \"start_line\": 11, \"end_line\": 11, \"kind\": \"reference\"}], \"warnings\": [\"FindReferencesAsync failed for Validate: InvalidOperationException: boom\"]}";
+    let json = "{\"version\": \"2.0\", \"symbol\": \"csharp Ns . V#Validate().\", \"references\": [{\"file\": \"src/generated.cs\", \"start_line\": 11, \"end_line\": 11, \"kind\": \"reference\"}], \"warnings\": [\"FindReferencesAsync failed for Validate: InvalidOperationException: boom\"]}";
     std::fs::write(out, json).unwrap();
 }
 "#;

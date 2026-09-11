@@ -77,7 +77,7 @@ mod roles {
 
 /// The only scip-csharp output version this parser understands (index, find-refs, batch-find-refs).
 /// Bump together with the helper whenever any JSON schema changes.
-pub const SUPPORTED_INDEX_VERSION: &str = "1.0";
+pub const SUPPORTED_INDEX_VERSION: &str = "2.0";
 
 // ── find-refs output format ───────────────────────────────────────
 
@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn test_parse_json_index_basic() {
         let json = r#"{
-            "metadata": {"version": "1.0", "tool_info": "scip-csharp"},
+            "metadata": {"version": "2.0", "tool_info": "scip-csharp"},
             "documents": [{
                 "relative_path": "src/Program.cs",
                 "occurrences": [{
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn test_parse_json_index_empty_symbol_skipped() {
         let json = r#"{
-            "metadata": {"version": "1.0", "tool_info": "test"},
+            "metadata": {"version": "2.0", "tool_info": "test"},
             "documents": [{
                 "relative_path": "src/A.cs",
                 "occurrences": [{
@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn test_parse_json_index_rejects_unknown_version() {
         let json = r#"{
-            "metadata": {"version": "2.0", "tool_info": "x"},
+            "metadata": {"version": "9.9", "tool_info": "x"},
             "documents": [],
             "external_symbols": []
         }"#;
@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn test_parse_find_refs_output_carries_warnings_through() {
         let json = r#"{
-            "version": "1.0",
+            "version": "2.0",
             "symbol": "csharp Ns . V#Validate().",
             "references": [{
                 "file": "src/A.cs",
@@ -340,7 +340,7 @@ mod tests {
         // Old helper binaries emit no warnings field: the serde default must
         // parse them as EMPTY (complete), never fail.
         let json = r#"{
-            "version": "1.0",
+            "version": "2.0",
             "symbol": "csharp Ns . V#Validate().",
             "references": [{
                 "file": "src/A.cs",

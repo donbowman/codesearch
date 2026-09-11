@@ -12,7 +12,7 @@ public sealed class ScipIndex
 
 public sealed class ScipMetadata
 {
-    public string Version { get; init; } = "1.0";
+    public string Version { get; init; } = "2.0";
     public string ToolInfo { get; init; } = "scip-csharp";
 }
 
@@ -43,7 +43,7 @@ public sealed class ScipSymbolInfo
 /// </summary>
 public sealed class FindRefsOutput
 {
-    public string Version { get; init; } = "1.0";
+    public string Version { get; init; } = "2.0";
     public string Symbol { get; set; } = "";
     public List<FindRefsOccurrence> References { get; init; } = [];
     /// <summary>
@@ -68,6 +68,6 @@ public sealed class FindRefsOccurrence
 /// </summary>
 public sealed class BatchFindRefsOutput
 {
-    public string Version { get; init; } = "1.0";
+    public string Version { get; init; } = "2.0";
     public List<FindRefsOutput> Results { get; init; } = [];
 }

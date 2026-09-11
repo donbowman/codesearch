@@ -56,7 +56,7 @@ public class FindRefsWireContractTests
                 warnings[0].GetString());
 
             // The rest of the contract parse_find_refs_output reads.
-            Assert.Equal("1.0", parsed.RootElement.GetProperty("version").GetString());
+            Assert.Equal("2.0", parsed.RootElement.GetProperty("version").GetString());
             var occurrence = parsed.RootElement.GetProperty("references")[0];
             Assert.True(
                 occurrence.TryGetProperty("start_line", out _),
