@@ -247,6 +247,7 @@ fn fingerprint_fields_present_when_set_and_omitted_when_none() {
                 end_line: 1,
                 kind: "definition".to_string(),
             }],
+            warnings: Vec::new(),
             index_age_seconds: 12,
             language: "csharp".to_string(),
             scope: "project:p".to_string(),
@@ -676,5 +677,137 @@ async fn without_language_a_single_installed_helper_answers_deterministically() 
         v["ambiguous"],
         serde_json::Value::Bool(true),
         "one installed helper must answer, not ask: {out}"
+    );
+}
+
+// ── Warnings contract: a partial answer must say so ─────────────────
+//
+// B3 honesty: resolution warnings persisted in LMDB surface on the resolved
+// answer; a clean answer must OMIT the field entirely (the additive-JSON
+// contract pins `skip_serializing_if`).
+
+/// Version byte + bincode of `Vec<(PathBuf, u32, u32, String)>` — the same
+/// bytes `serialize_refs` writes for a `StoredReference` (bincode encodes a
+/// struct as its fields in declaration order, identical to the tuple).
+fn stored_refs_bytes(file: &str, kind: &str) -> Vec<u8> {
+    let mut bytes = vec![1u8];
+    bytes.extend_from_slice(
+        &bincode::serialize(&vec![(
+            std::path::PathBuf::from(file),
+            7u32,
+            9u32,
+            kind.to_string(),
+        )])
+        .unwrap(),
+    );
+    bytes
+}
+
+/// Version byte + bincode of `Vec<String>` — the same bytes the lazy and
+/// batch write paths store in `scip_ref_warnings` (the key-list format).
+fn warnings_bytes(warnings: &[&str]) -> Vec<u8> {
+    let owned: Vec<String> = warnings.iter().map(|w| w.to_string()).collect();
+    let mut bytes = vec![1u8];
+    bytes.extend_from_slice(&bincode::serialize(&owned).unwrap());
+    bytes
+}
+
+/// One resolved symbol with persisted warnings, one without.
+fn populate_warnings_fixture(db_path: &std::path::Path) -> (String, String) {
+    let warned_key = "csharp Ns . W#Warned().".to_string();
+    let clean_key = "csharp Ns . C#Clean().".to_string();
+    let env = crate::symbols::get_shared_scip_env(db_path).expect("shared env");
+    let mut wtxn = env.write_txn().expect("wtxn");
+    let symbols: heed::Database<heed::types::Str, heed::types::Bytes> = env
+        .open_database(&wtxn, Some(crate::constants::SCIP_SYMBOLS_DB_NAME))
+        .unwrap()
+        .unwrap();
+    for key in [&warned_key, &clean_key] {
+        symbols
+            .put(
+                &mut wtxn,
+                key.as_str(),
+                &stored_refs_bytes("src/w.cs", "definition"),
+            )
+            .unwrap();
+    }
+    let warnings_db: heed::Database<heed::types::Str, heed::types::Bytes> = env
+        .create_database(&mut wtxn, Some(crate::constants::SCIP_REF_WARNINGS_DB_NAME))
+        .unwrap();
+    warnings_db
+        .put(
+            &mut wtxn,
+            warned_key.as_str(),
+            &warnings_bytes(&[
+                "FindReferencesAsync failed for Warned: InvalidOperationException: boom",
+            ]),
+        )
+        .unwrap();
+    wtxn.commit().unwrap();
+    (warned_key, clean_key)
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn resolved_answer_surfaces_persisted_warnings() {
+    let helper_root = tempfile::tempdir().unwrap();
+    let _guard = make_helper_available(&helper_root);
+    let (service, project) = build_service();
+    let (warned_key, _clean_key) =
+        populate_warnings_fixture(&project.path().join(".codesearch.db"));
+
+    let out = tool_text(
+        &service,
+        FindImpactRequest {
+            symbol_key: Some(warned_key.clone()),
+            ..find_impact_request()
+        },
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["resolved_symbol"], warned_key,
+        "the fixture query must actually resolve, got: {out}"
+    );
+    let warnings = v["warnings"].as_array().expect("warnings array present");
+    assert_eq!(
+        warnings.len(),
+        1,
+        "the persisted warning must surface: {out}"
+    );
+    assert!(
+        warnings[0]
+            .as_str()
+            .unwrap()
+            .contains("FindReferencesAsync failed for Warned"),
+        "warning text must round-trip verbatim: {out}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn clean_resolved_answer_omits_the_warnings_field() {
+    let helper_root = tempfile::tempdir().unwrap();
+    let _guard = make_helper_available(&helper_root);
+    let (service, project) = build_service();
+    let (_warned_key, clean_key) =
+        populate_warnings_fixture(&project.path().join(".codesearch.db"));
+
+    let out = tool_text(
+        &service,
+        FindImpactRequest {
+            symbol_key: Some(clean_key.clone()),
+            ..find_impact_request()
+        },
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["resolved_symbol"], clean_key,
+        "the fixture query must actually resolve, got: {out}"
+    );
+    assert!(
+        v.get("warnings").is_none(),
+        "a clean answer must OMIT warnings (skip_serializing_if), got: {out}"
     );
 }

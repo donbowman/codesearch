@@ -182,3 +182,137 @@ fn references_for_key_returns_stored_definitions() {
     assert_eq!(refs[0].kind, "definition");
     assert_eq!(refs[0].file, PathBuf::from("src/math.ts"));
 }
+
+#[test]
+fn lookup_warnings_reads_the_index_warnings_meta_entry() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = dir.path().join("db");
+    let (a1, _a2, _mul) = populate_ambiguity_fixture(&db);
+    let indexer = TypeScriptSymbolIndexer::new();
+
+    // No entry yet (pre-warnings index) → empty = complete.
+    assert!(indexer.lookup_warnings(&db, &a1).is_empty());
+
+    // Hand-populate the meta entry exactly the way the rebuild flow writes
+    // it: a JSON array under the namespaced meta key.
+    let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+    let mut wtxn = env.write_txn().unwrap();
+    let meta: Database<Str, Str> = env
+        .open_database(&wtxn, Some(SCIP_META_DB_NAME))
+        .unwrap()
+        .unwrap();
+    meta.put(
+        &mut wtxn,
+        META_INDEX_WARNINGS,
+        r#"["scip-typescript exited with 1 for /repo — index may be incomplete"]"#,
+    )
+    .unwrap();
+    wtxn.commit().unwrap();
+
+    let warnings = indexer.lookup_warnings(&db, &a1);
+    assert_eq!(warnings.len(), 1, "the stored warning must be read back");
+    assert!(
+        warnings[0].contains("scip-typescript exited with 1"),
+        "warning text must round-trip, got: {}",
+        warnings[0]
+    );
+
+    // The entry is per-index, not per-symbol: every key reports it.
+    assert_eq!(
+        indexer
+            .lookup_warnings(&db, "scip-typescript npm mypkg 1.0.0 `src/other.ts`/x().")
+            .len(),
+        1
+    );
+
+    // An empty array (what a clean reindex writes) must read as complete.
+    let mut wtxn = env.write_txn().unwrap();
+    let meta: Database<Str, Str> = env
+        .open_database(&wtxn, Some(SCIP_META_DB_NAME))
+        .unwrap()
+        .unwrap();
+    meta.put(&mut wtxn, META_INDEX_WARNINGS, "[]").unwrap();
+    wtxn.commit().unwrap();
+    assert!(
+        indexer.lookup_warnings(&db, &a1).is_empty(),
+        "an empty warnings array must mean complete"
+    );
+}
+
+// ── B3 warnings: the rebuild's meta-write site, driven for real ──────
+//
+// The test above hand-writes the META_INDEX_WARNINGS entry (consumer
+// half). This one drives the producer: a helper that exits non-zero, so
+// the rebuild flow must persist the completeness warning itself.
+
+/// A fake `scip-typescript` with the partial-output contract: exits
+/// non-zero AFTER writing the `--output` file, so the rebuild must both
+/// capture the warning and parse the (here empty — a valid default index)
+/// output. `resolve_helper` only checks `is_file()`, so a shell script is
+/// accepted as the env-var helper.
+fn write_failing_helper(dir: &Path) -> PathBuf {
+    let (path, script) = if cfg!(windows) {
+        (
+            dir.join("fake-scip-typescript.cmd"),
+            "@echo off\r\ntype nul > \"%~3\"\r\nexit /b 3\r\n".to_string(),
+        )
+    } else {
+        (
+            dir.join("fake-scip-typescript"),
+            "#!/bin/sh\n: > \"$3\"\nexit 3\n".to_string(),
+        )
+    };
+    std::fs::write(&path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path
+}
+
+#[test]
+#[serial_test::serial]
+fn rebuild_persists_the_nonzero_exit_warning_into_the_meta_table() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    let db = dir.path().join("db");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("tsconfig.json"), "{}").unwrap();
+
+    let helper_bin = dir.path().join("helper-bin");
+    std::fs::create_dir(&helper_bin).unwrap();
+    let helper = write_failing_helper(&helper_bin);
+    let _guard = crate::testing::EnvRestore::set(&[(
+        SCIP_TYPESCRIPT_HELPER_ENV,
+        helper.to_string_lossy().as_ref(),
+    )]);
+
+    let indexer = TypeScriptSymbolIndexer::new();
+    let any_key = "scip-typescript npm mypkg 1.0.0 `src/x.ts`/f().";
+    assert!(indexer.lookup_warnings(&db, any_key).is_empty());
+
+    // Non-zero helper exit must NOT fail the rebuild — partial output is
+    // acceptable — but the warning must ride into the meta table.
+    let summary = indexer
+        .rebuild(&repo, &db, RebuildScope::Full)
+        .expect("a failing helper must still complete the rebuild");
+    assert_eq!(
+        summary.symbols_indexed, 0,
+        "the fake helper wrote an empty index, nothing else"
+    );
+
+    // THE PRODUCER ASSERTION: the warning from the non-zero exit was
+    // persisted by the rebuild's META_INDEX_WARNINGS write.
+    let warnings = indexer.lookup_warnings(&db, any_key);
+    assert_eq!(
+        warnings.len(),
+        1,
+        "the rebuild must persist the non-zero-exit warning"
+    );
+    assert!(
+        warnings[0].contains("exit code: 3"),
+        "warning text must name the exit status, got: {}",
+        warnings[0]
+    );
+}

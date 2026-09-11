@@ -46,6 +46,12 @@ public sealed class FindRefsOutput
     public string Version { get; init; } = "1.0";
     public string Symbol { get; set; } = "";
     public List<FindRefsOccurrence> References { get; init; } = [];
+    /// <summary>
+    /// Non-fatal problems survived while resolving this symbol (a project
+    /// that failed to compile, a FindReferencesAsync exception). Non-empty
+    /// means the reference list may be incomplete.
+    /// </summary>
+    public List<string> Warnings { get; init; } = [];
 }
 
 public sealed class FindRefsOccurrence

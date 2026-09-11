@@ -34,7 +34,7 @@ use super::{ImpactQuery, KeyMatch, RebuildScope, RebuildSummary, SymbolIndexer, 
 
 use crate::constants::{
     LANG_TYPESCRIPT, SCIP_POSITION_DB_NAME, SCIP_SIMPLE_NAMES_DB_NAME, SCIP_SYMBOLS_DB_NAME,
-    SCIP_TYPESCRIPT_HEAD_SHA_KEY, SCIP_TYPESCRIPT_HELPER_ENV,
+    SCIP_TYPESCRIPT_HEAD_SHA_KEY, SCIP_TYPESCRIPT_HELPER_ENV, SCIP_TYPESCRIPT_INDEX_WARNINGS_KEY,
     SCIP_TYPESCRIPT_REBUILD_TIMESTAMP_KEY,
 };
 
@@ -59,6 +59,10 @@ const META_REBUILD_TS: &str = SCIP_TYPESCRIPT_REBUILD_TIMESTAMP_KEY;
 
 /// Key in the meta database storing the git HEAD sha the index was built for.
 const META_HEAD_SHA: &str = SCIP_TYPESCRIPT_HEAD_SHA_KEY;
+
+/// Key in the meta database storing the index-completeness warnings (a JSON
+/// array) from the last `scip-typescript` run. Empty array = complete.
+const META_INDEX_WARNINGS: &str = SCIP_TYPESCRIPT_INDEX_WARNINGS_KEY;
 
 /// Key in the meta database storing the count of indexed symbols.
 const META_SYMBOL_COUNT: &str = "symbol_count:typescript";
@@ -278,13 +282,15 @@ impl TypeScriptSymbolIndexer {
     }
 
     /// Invoke `scip-typescript index` against `project_root`, writing the SCIP
-    /// protobuf index to `output_path`.
+    /// protobuf index to `output_path`. Returns the completeness warning when
+    /// the run exited non-zero (partial output is acceptable, mirroring the
+    /// C# adapter) — the caller persists it so the partial index stays honest.
     fn invoke_index_helper(
         &self,
         invocation: &HelperInvocation,
         project_root: &Path,
         output_path: &Path,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let mut cmd = match invocation {
             HelperInvocation::Direct(path) => Command::new(path),
             HelperInvocation::Npx => {
@@ -345,15 +351,19 @@ impl TypeScriptSymbolIndexer {
         }
 
         if !output.status.success() {
-            tracing::warn!(
-                "scip-typescript exited with {} for {}",
+            let warning = format!(
+                "scip-typescript exited with {} for {} — index may be incomplete",
                 output.status,
                 project_root.display()
             );
-            // Don't bail — partial output is acceptable, mirroring the C# adapter.
+            tracing::warn!("{warning}");
+            // Don't bail — partial output is acceptable, mirroring the C#
+            // adapter — but the warning travels to the caller, which
+            // persists it so the partial index can never pass for complete.
+            return Ok(Some(warning));
         }
 
-        Ok(())
+        Ok(None)
     }
 
     /// Resolve a user-supplied symbol query to canonical SCIP key(s).
@@ -466,7 +476,7 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
         }
         let _output_guard = TempFileGuard(output_path.clone());
 
-        self.invoke_index_helper(&invocation, repo_path, &output_path)?;
+        let index_warning = self.invoke_index_helper(&invocation, repo_path, &output_path)?;
 
         let index_data = std::fs::read(&output_path)
             .with_context(|| format!("Failed to read SCIP index at {}", output_path.display()))?;
@@ -574,6 +584,17 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
         if let Some(sha) = super::current_git_head(repo_path) {
             meta_db.put(&mut wtxn, META_HEAD_SHA, sha.as_str())?;
         }
+        // Persist index completeness as a JSON array. ALWAYS written — also
+        // on a clean run, as an empty array — so a successful reindex clears
+        // stale warnings instead of leaving a fixed index claiming partiality.
+        let index_warnings: Vec<String> = index_warning.into_iter().collect();
+        meta_db.put(
+            &mut wtxn,
+            META_INDEX_WARNINGS,
+            serde_json::to_string(&index_warnings)
+                .context("Failed to serialize TypeScript index warnings")?
+                .as_str(),
+        )?;
 
         wtxn.commit()?;
 
@@ -673,6 +694,27 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
                 kind: r.kind,
             })
             .collect())
+    }
+
+    fn lookup_warnings(&self, db_path: &Path, _canonical: &str) -> Vec<String> {
+        // Plain LMDB read — never a helper invocation. The meta entry is
+        // per-INDEX, not per-symbol (scip-typescript has no per-symbol
+        // resolution), so every canonical key of this index reports the
+        // same warnings. Absence (pre-warnings indexes) reads as complete.
+        let Some(env) = self.open_scip_env(db_path).ok() else {
+            return Vec::new();
+        };
+        let Ok(rtxn) = env.read_txn() else {
+            return Vec::new();
+        };
+        let raw = match env.open_database::<Str, Str>(&rtxn, Some(SCIP_META_DB_NAME)) {
+            Ok(Some(meta)) => match meta.get(&rtxn, META_INDEX_WARNINGS) {
+                Ok(Some(raw)) => raw,
+                _ => return Vec::new(),
+            },
+            _ => return Vec::new(),
+        };
+        serde_json::from_str(raw).unwrap_or_default()
     }
 
     fn index_age(&self, db_path: &Path) -> u64 {

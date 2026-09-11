@@ -118,6 +118,10 @@ const SCIP_SIMPLE_NAMES_DB_NAME: &str = crate::constants::SCIP_SIMPLE_NAMES_DB_N
 /// LMDB database name for the on-demand reference cache (populated by find-refs).
 const SCIP_REF_CACHE_DB_NAME: &str = crate::constants::SCIP_REF_CACHE_DB_NAME;
 
+/// LMDB database name for per-symbol completeness warnings persisted
+/// alongside the reference cache (absence of an entry = complete).
+const SCIP_REF_WARNINGS_DB_NAME: &str = crate::constants::SCIP_REF_WARNINGS_DB_NAME;
+
 /// Key in the meta database that stores the last rebuild timestamp (UNIX epoch seconds).
 const META_REBUILD_TS: &str = crate::constants::SCIP_REBUILD_TIMESTAMP_KEY;
 
@@ -227,6 +231,44 @@ fn deserialize_keys_v1(bytes: &[u8]) -> Result<Vec<String>> {
         );
     }
     bincode::deserialize(&bytes[1..]).with_context(|| "bincode deserialize keys failed")
+}
+
+// ── Ref-resolution warnings persistence ───────────────────────────
+
+/// Persist one canonical key's resolution warnings into `scip_ref_warnings`,
+/// in the caller's transaction so the cached refs and their honesty land as
+/// ONE atomic fact. Empty warnings REMOVE the entry — absence means
+/// "complete", so a later clean re-resolution clears a stale warning
+/// instead of reporting it forever. (Wire format = the key-list format:
+/// version byte + bincode Vec<String>.)
+fn store_ref_warnings(
+    env: &TrackedEnv,
+    wtxn: &mut heed::RwTxn<'_>,
+    canonical: &str,
+    warnings: &[String],
+) -> Result<()> {
+    let db: Database<Str, Bytes> = env.create_database(wtxn, Some(SCIP_REF_WARNINGS_DB_NAME))?;
+    if warnings.is_empty() {
+        db.delete(wtxn, canonical)?;
+    } else {
+        let bytes = serialize_keys_v1(warnings)
+            .with_context(|| format!("Failed to serialize warnings for {canonical}"))?;
+        db.put(wtxn, canonical, &bytes)?;
+    }
+    Ok(())
+}
+
+/// Read one canonical key's warnings. Missing database or entry — and an
+/// undecodable value — read as empty (complete): a warning that cannot be
+/// read must not fail a lookup that has valid references.
+fn read_ref_warnings(env: &TrackedEnv, rtxn: &heed::RoTxn<'_>, canonical: &str) -> Vec<String> {
+    match env.open_database::<Str, Bytes>(rtxn, Some(SCIP_REF_WARNINGS_DB_NAME)) {
+        Ok(Some(db)) => match db.get(rtxn, canonical) {
+            Ok(Some(bytes)) => deserialize_keys_v1(bytes).unwrap_or_default(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
 }
 
 // ── Simple-name extraction ─────────────────────────────────────────
@@ -530,16 +572,17 @@ impl CSharpSymbolIndexer {
         Ok(())
     }
 
-    /// Invoke `scip-csharp find-refs` for a single symbol and return its references.
+    /// Invoke `scip-csharp find-refs` for a single symbol and return its
+    /// references plus the completeness warnings the helper reported.
     ///
-    /// This is the "lazy" half of Opt 2: called on first `find_impact` for a symbol
-    /// that has not yet been resolved. Result is cached in `scip_ref_cache`.
+    /// This is the "lazy" half of Opt 2: called on first `find_impact` for a
+    /// symbol that has not yet been resolved. Result is cached in `scip_ref_cache`.
     fn invoke_find_refs_helper(
         &self,
         helper: &Path,
         solution: &Path,
         symbol: &str,
-    ) -> Result<Vec<StoredReference>> {
+    ) -> Result<(Vec<StoredReference>, Vec<String>)> {
         let start = std::time::Instant::now();
 
         let temp_dir = std::env::temp_dir().join("codesearch-scip");
@@ -649,7 +692,7 @@ impl CSharpSymbolIndexer {
             start.elapsed().as_millis()
         );
 
-        Ok(stored)
+        Ok((stored, result.warnings))
     }
 
     // ── Internal lookup helpers ────────────────────────────────────
@@ -766,6 +809,16 @@ impl CSharpSymbolIndexer {
         } // rtxn dropped here
 
         if cache_hit || has_legacy_refs {
+            // A cached answer replays the warnings persisted WITH it — the
+            // honesty is part of the cached fact, so a partial result can
+            // never quietly pass for complete on the 2nd+ call.
+            let warnings = {
+                let rtxn = env.read_txn()?;
+                read_ref_warnings(&env, &rtxn, canonical)
+            };
+            for w in &warnings {
+                tracing::warn!("cached refs for '{}' may be incomplete: {}", canonical, w);
+            }
             return Ok(all_stored.into_iter().map(stored_to_symbol_ref).collect());
         }
 
@@ -824,27 +877,33 @@ impl CSharpSymbolIndexer {
         // spawning a fresh helper per call. Fallback: the one-shot spawn,
         // which keeps working when the pool cannot (spawn failure, heap-cap
         // death, eviction race) — correctness never depends on residency.
-        let lazy_refs: Vec<StoredReference> = match crate::symbols::resident::WORKSPACE_POOL
-            .find_refs(&helper, &solution, canonical)
-        {
-            Ok(refs) => refs
-                .into_iter()
-                .map(|r| StoredReference {
-                    file: r.file,
-                    start_line: r.start_line,
-                    end_line: r.end_line,
-                    kind: r.kind,
-                })
-                .collect(),
-            Err(e) => {
-                tracing::warn!(
-                    "resident helper unavailable ({e:#}); falling back to one-shot \
-                     find-refs for '{}'",
-                    canonical
-                );
-                self.invoke_find_refs_helper(&helper, &solution, canonical)?
-            }
-        };
+        // Both paths carry completeness warnings; a partial answer must be
+        // cached AS partial, never as a complete one.
+        let (lazy_refs, lazy_warnings): (Vec<StoredReference>, Vec<String>) =
+            match crate::symbols::resident::WORKSPACE_POOL.find_refs(&helper, &solution, canonical)
+            {
+                Ok(resident) => (
+                    resident
+                        .references
+                        .into_iter()
+                        .map(|r| StoredReference {
+                            file: r.file,
+                            start_line: r.start_line,
+                            end_line: r.end_line,
+                            kind: r.kind,
+                        })
+                        .collect(),
+                    resident.warnings,
+                ),
+                Err(e) => {
+                    tracing::warn!(
+                        "resident helper unavailable ({e:#}); falling back to one-shot \
+                         find-refs for '{}'",
+                        canonical
+                    );
+                    self.invoke_find_refs_helper(&helper, &solution, canonical)?
+                }
+            };
 
         // ── Write phase — cache the resolved references ────────────
         {
@@ -854,6 +913,9 @@ impl CSharpSymbolIndexer {
             let cached_bytes = serialize_refs(&lazy_refs)
                 .with_context(|| format!("Failed to serialize refs for cache: {}", canonical))?;
             ref_cache_db.put(&mut wtxn, canonical, &cached_bytes)?;
+            // Same txn as the refs: cached-partial and its warnings are one
+            // atomic fact. Empty warnings remove any stale entry.
+            store_ref_warnings(&env, &mut wtxn, canonical, &lazy_warnings)?;
             wtxn.commit()?;
         }
 
@@ -1116,6 +1178,10 @@ impl CSharpSymbolIndexer {
         struct SymbolResult {
             symbol: String,
             references: Vec<RefEntry>,
+            /// Absent in helper output from before warnings existed —
+            /// default to empty so old binaries keep parsing as "complete".
+            #[serde(default)]
+            warnings: Vec<String>,
         }
 
         #[derive(serde::Deserialize)]
@@ -1167,6 +1233,9 @@ impl CSharpSymbolIndexer {
             let bytes = serialize_refs(&refs)
                 .with_context(|| format!("Failed to serialize batch refs for {}", result.symbol))?;
             ref_cache_db.put(&mut wtxn, result.symbol.as_str(), &bytes)?;
+            // Same txn as the refs: cached-partial and its warnings are one
+            // atomic fact. Empty warnings remove any stale entry.
+            store_ref_warnings(&env, &mut wtxn, &result.symbol, &result.warnings)?;
             cached_count += 1;
         }
 
@@ -1660,6 +1729,20 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         self.find_refs_for_canonical_key(db_path, canonical_key)
     }
 
+    fn lookup_warnings(&self, db_path: &Path, canonical: &str) -> Vec<String> {
+        // Plain LMDB read — never a helper invocation, so the find_impact
+        // handler can call it after a lookup without risking minutes of work.
+        let env = match self.open_scip_env(db_path) {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+        let rtxn = match env.read_txn() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        read_ref_warnings(&env, &rtxn, canonical)
+    }
+
     fn index_age(&self, db_path: &Path) -> u64 {
         let env = match self.open_scip_env(db_path) {
             Ok(e) => e,
@@ -2012,5 +2095,241 @@ mod tests {
         assert_eq!(refs.len(), 1, "definitions only, got {refs:?}");
         assert_eq!(refs[0].kind, "definition");
         assert_eq!(refs[0].file, PathBuf::from("src/v.cs"));
+    }
+
+    #[test]
+    fn lookup_warnings_reads_the_ref_warnings_db_and_absence_is_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("db");
+        let (v1, _v2, compute) = populate_ambiguity_fixture(&db);
+
+        // Hand-populate warnings for v1 only (same wire format the lazy and
+        // batch write paths use: version byte + bincode Vec<String>).
+        let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+        {
+            let mut wtxn = env.write_txn().unwrap();
+            store_ref_warnings(
+                &env,
+                &mut wtxn,
+                &v1,
+                &[
+                    "FindReferencesAsync failed for Validate: InvalidOperationException: boom"
+                        .to_string(),
+                ],
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let indexer = CSharpSymbolIndexer::new();
+        let warnings = indexer.lookup_warnings(&db, &v1);
+        assert_eq!(warnings.len(), 1, "the stored warning must be read back");
+        assert!(
+            warnings[0].contains("FindReferencesAsync failed"),
+            "warning text must round-trip, got: {}",
+            warnings[0]
+        );
+
+        // A key with no entry reads as empty (complete), never an error.
+        assert!(indexer.lookup_warnings(&db, &compute).is_empty());
+
+        // Empty warnings must REMOVE the entry: absence = complete, so a
+        // clean re-resolution clears a stale warning instead of reporting
+        // it forever (a partial find-refs result that was cached and later
+        // re-resolved cleanly must stop claiming partiality).
+        {
+            let mut wtxn = env.write_txn().unwrap();
+            store_ref_warnings(&env, &mut wtxn, &v1, &[]).unwrap();
+            wtxn.commit().unwrap();
+        }
+        assert!(
+            indexer.lookup_warnings(&db, &v1).is_empty(),
+            "storing empty warnings must clear the persisted entry"
+        );
+    }
+
+    // ── B3 warnings: producer-side coverage (the sites that WRITE) ──
+    //
+    // Every test above hand-populates the warnings store (the consumer
+    // half). These two drive the real producer sites instead, so deleting
+    // the store_ref_warnings call in parse_and_cache_batch_refs or in the
+    // lazy write phase fails here.
+
+    /// A real helper executable, built with the test run's own rustc.
+    ///
+    /// A `.cmd` script cannot stand in: `validate_helper_path` accepts only
+    /// the literal filename `scip-csharp(.exe)`, and CreateProcess refuses
+    /// batch content under an `.exe` name, so the file must be a real PE.
+    /// Behaviour: `serve` exits without the handshake (the pool's wait_ready
+    /// hits EOF and errors, routing the caller through the one-shot
+    /// fallback); `find-refs` writes a fixed warnings-bearing JSON to its
+    /// `--output` path, mirroring a helper that survived a partial failure.
+    const FAKE_HELPER_SRC: &str = r#"fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("serve") {
+        return;
+    }
+    let out = args
+        .iter()
+        .position(|a| a == "--output")
+        .and_then(|i| args.get(i + 1))
+        .expect("usage: find-refs ... --output <path>");
+    let json = "{\"version\": \"1.0\", \"symbol\": \"csharp Ns . V#Validate().\", \"references\": [{\"file\": \"src/generated.cs\", \"start_line\": 11, \"end_line\": 11, \"kind\": \"reference\"}], \"warnings\": [\"FindReferencesAsync failed for Validate: InvalidOperationException: boom\"]}";
+    std::fs::write(out, json).unwrap();
+}
+"#;
+
+    fn build_fake_csharp_helper(dir: &Path) -> PathBuf {
+        let src_path = dir.join("fake_helper.rs");
+        std::fs::write(&src_path, FAKE_HELPER_SRC).unwrap();
+        let exe_path = dir.join(if cfg!(windows) {
+            "scip-csharp.exe"
+        } else {
+            "scip-csharp"
+        });
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let status = std::process::Command::new(rustc)
+            .args(["--edition", "2021", "-Cdebuginfo=0"])
+            .arg("-o")
+            .arg(&exe_path)
+            .arg(&src_path)
+            .status()
+            .expect("spawn rustc to build the fake helper");
+        assert!(status.success(), "rustc failed to compile the fake helper");
+        exe_path
+    }
+
+    #[test]
+    fn batch_parse_persists_helper_warnings_alongside_the_cached_refs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("db");
+        let key = "csharp Ns . V#Validate().";
+
+        // Batch-find-refs output exactly as the helper writes it: version
+        // 1.0, one resolved symbol, a `warnings` array reporting what it
+        // survived.
+        let output_path = dir.path().join("batch-refs.json");
+        let doc = serde_json::json!({
+            "version": scip_parse::SUPPORTED_INDEX_VERSION,
+            "results": [{
+                "symbol": key,
+                "references": [
+                    {"file": "src/generated.cs", "start_line": 11, "end_line": 11, "kind": "reference"},
+                ],
+                "warnings": [
+                    "could not compile project 'Broken' — its symbols are missing from the map",
+                ],
+            }],
+        });
+        std::fs::write(&output_path, doc.to_string()).unwrap();
+
+        let indexer = CSharpSymbolIndexer::new();
+        let cached = indexer
+            .parse_and_cache_batch_refs(&db, &output_path)
+            .unwrap();
+        assert_eq!(cached, 1, "the one result must be cached");
+
+        // The refs landed in the cache...
+        let refs = indexer.find_references_for_key(&db, key).unwrap();
+        assert!(
+            refs.iter()
+                .any(|r| r.file == Path::new("src/generated.cs") && r.kind == "reference"),
+            "the batch refs must be cached, got {refs:?}"
+        );
+        // ...and the warning the helper reported must be persisted WITH
+        // them — the cached-partial fact is one atomic fact.
+        let warnings = indexer.lookup_warnings(&db, key);
+        assert_eq!(warnings.len(), 1, "the batch warning must be persisted");
+        assert!(
+            warnings[0].contains("could not compile project 'Broken'"),
+            "warning text must round-trip, got: {}",
+            warnings[0]
+        );
+
+        // A later batch run WITHOUT the warnings field (an old helper) must
+        // clear the stale warning: absence = complete, so a clean
+        // re-resolution stops claiming partiality.
+        let clean_path = dir.path().join("batch-refs-clean.json");
+        let clean = serde_json::json!({
+            "version": scip_parse::SUPPORTED_INDEX_VERSION,
+            "results": [{
+                "symbol": key,
+                "references": [],
+            }],
+        });
+        std::fs::write(&clean_path, clean.to_string()).unwrap();
+        indexer
+            .parse_and_cache_batch_refs(&db, &clean_path)
+            .unwrap();
+        assert!(
+            indexer.lookup_warnings(&db, key).is_empty(),
+            "a warnings-free batch result must clear the stale warning"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn lazy_cache_miss_persists_helper_warnings_alongside_the_cached_refs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("db");
+        // The .sln sits at db_path.parent() — the repo_path the lazy path
+        // falls back to when scip_meta carries no META_REPO_PATH.
+        std::fs::write(dir.path().join("FakeSolution.sln"), "").unwrap();
+
+        // Cache-miss fixture: one DEFINITION-only entry (no cached refs, no
+        // legacy reference kinds), so the lazy find-refs path runs.
+        let key = "csharp Ns . V#Validate().";
+        {
+            let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+            let mut wtxn = env.write_txn().unwrap();
+            let symbols: Database<Str, Bytes> = env
+                .open_database(&wtxn, Some(SCIP_DB_NAME))
+                .unwrap()
+                .unwrap();
+            symbols
+                .put(
+                    &mut wtxn,
+                    key,
+                    &serialize_refs(&[StoredReference {
+                        file: PathBuf::from("src/v.cs"),
+                        start_line: 1,
+                        end_line: 1,
+                        kind: "definition".into(),
+                    }])
+                    .unwrap(),
+                )
+                .unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let helper_dir = dir.path().join("helper");
+        std::fs::create_dir(&helper_dir).unwrap();
+        let helper = build_fake_csharp_helper(&helper_dir);
+        let _guard =
+            crate::testing::EnvRestore::set(&[(HELPER_ENV_VAR, helper.to_string_lossy().as_ref())]);
+
+        let indexer = CSharpSymbolIndexer::new();
+        let refs = indexer.find_references_for_key(&db, key).unwrap();
+
+        // The helper's reference made it through the whole pipe: resident
+        // handshake fail → one-shot spawn → JSON parse → return.
+        assert!(
+            refs.iter()
+                .any(|r| r.file == Path::new("src/generated.cs") && r.kind == "reference"),
+            "the helper's reference must be returned, got {refs:?}"
+        );
+        // THE PRODUCER ASSERTION: the helper's warning was persisted by the
+        // SAME write phase that cached the refs (find_refs_for_canonical_key).
+        let warnings = indexer.lookup_warnings(&db, key);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the lazy path must persist the helper's warning together with the cache"
+        );
+        assert!(
+            warnings[0].contains("FindReferencesAsync failed"),
+            "warning text must round-trip, got: {}",
+            warnings[0]
+        );
     }
 }

@@ -112,7 +112,7 @@ impl CodesearchService {
     /// with `symbol_key` set to exactly one candidate. Every resolved answer names the
     /// selected canonical key in `resolved_symbol`.
     #[tool(
-        description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nThe right tool for \"who calls X?\" / \"what breaks if I rename X?\". Returns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands language semantics.\n\nInput variants (mutually exclusive):\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n- By exact canonical key: `{ \"symbol_key\": \"csharp . . . FieldDefinition#Validate().\", \"project\": \"myrepo\" }`\n\nAMBIGUITY: if several stored symbols match (overloads, same-line definitions), the answer is `{\"ambiguous\": true, \"query\": ..., \"candidates\": [...]}` — pick one candidate and re-call with `symbol_key` set to it verbatim. A resolved answer names the selected canonical key in `resolved_symbol`; never assume which overload answered.\n\nLANGUAGE: if `language` is omitted, position lookups auto-detect it from the file extension; with several SCIP helpers installed the answer asks you to name one — pass `language` to avoid the round-trip.\n\nPrecision backends (SCIP) ship per language; C# (bundled `scip-csharp` helper, `-with-csharp` releases) and TypeScript (via `npx` or `CODESEARCH_SCIP_TYPESCRIPT`) are available today. For Rust/Python/Go/etc., use `find` with `kind=\"usages\"` as a text-based fallback until SCIP backends for those languages ship.\n\nOn a busy answer (`\"busy\": true`): sleep `retry_after_seconds` and retry the SAME call. Busy is progress, not failure — never fall back to text search on busy.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
+        description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nThe right tool for \"who calls X?\" / \"what breaks if I rename X?\". Returns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands language semantics.\n\nInput variants (mutually exclusive):\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n- By exact canonical key: `{ \"symbol_key\": \"csharp . . . FieldDefinition#Validate().\", \"project\": \"myrepo\" }`\n\nAMBIGUITY: if several stored symbols match (overloads, same-line definitions), the answer is `{\"ambiguous\": true, \"query\": ..., \"candidates\": [...]}` — pick one candidate and re-call with `symbol_key` set to it verbatim. A resolved answer names the selected canonical key in `resolved_symbol`; never assume which overload answered.\n\nWARNINGS: a resolved answer may carry a `\"warnings\": [\"...\"]` array — non-empty means the reference list may be INCOMPLETE because a helper failure was survived rather than fatal (a project that failed to compile, an exception during reference resolution, a non-zero scip-typescript exit). Each entry names what failed. Treat warnings as a prompt to reindex the project (or cross-check with `find` `kind=\"usages\"`) before concluding \"no callers\" — absent or empty means the answer is as complete as the index knows.\n\nLANGUAGE: if `language` is omitted, position lookups auto-detect it from the file extension; with several SCIP helpers installed the answer asks you to name one — pass `language` to avoid the round-trip.\n\nPrecision backends (SCIP) ship per language; C# (bundled `scip-csharp` helper, `-with-csharp` releases) and TypeScript (via `npx` or `CODESEARCH_SCIP_TYPESCRIPT`) are available today. For Rust/Python/Go/etc., use `find` with `kind=\"usages\"` as a text-based fallback until SCIP backends for those languages ship.\n\nOn a busy answer (`\"busy\": true`): sleep `retry_after_seconds` and retry the SAME call. Busy is progress, not failure — never fall back to text search on busy.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
     )]
     async fn find_impact(
         &self,
@@ -317,12 +317,14 @@ impl CodesearchService {
         // byte-identical to a budget-fast completion, so both build the
         // response through this one closure.
         let build_impact = |references: Vec<crate::symbols::SymbolReference>,
-                            resolved_symbol: Option<String>|
+                            resolved_symbol: Option<String>,
+                            warnings: Vec<String>|
          -> crate::symbols::FindImpactResult {
             crate::symbols::FindImpactResult {
                 symbol: echo.clone(),
                 resolved_symbol,
                 references: dedupe_references(references),
+                warnings,
                 index_age_seconds: indexer.index_age(&db_path),
                 language: indexer.language().to_string(),
                 scope: ctx
@@ -405,7 +407,7 @@ impl CodesearchService {
             Ok(crate::symbols::KeyMatch::NotFound) => {
                 // Preserve the historical contract for fuzzy queries: an
                 // unresolvable name/position answers empty references.
-                let impact = build_impact(Vec::new(), None);
+                let impact = build_impact(Vec::new(), None, Vec::new());
                 let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
                 return Ok(CallToolResult::success(vec![Content::text(json)]));
             }
@@ -445,7 +447,10 @@ impl CodesearchService {
                     references.len(),
                     busy_state
                 );
-                let impact = build_impact(references, Some(canonical.clone()));
+                // The warm retry must carry the same honesty as a fresh
+                // answer: read the persisted warnings for this key.
+                let warnings = indexer.lookup_warnings(&db_path, &canonical);
+                let impact = build_impact(references, Some(canonical.clone()), warnings);
                 let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
                 return Ok(CallToolResult::success(vec![Content::text(json)]));
             }
@@ -498,7 +503,10 @@ impl CodesearchService {
                 // Completed within the budget: nothing is in flight, so a
                 // later lookup must consult the real cache, not the tracker.
                 find_impact_tracker::IMPACT_LOOKUP_TRACKER.remove(&tracker_key);
-                let impact = build_impact(references, Some(canonical));
+                // Surface what the lookup survived: a partial answer must
+                // say so in its own payload, not only in a log line.
+                let warnings = indexer.lookup_warnings(&db_path, &canonical);
+                let impact = build_impact(references, Some(canonical), warnings);
                 let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
                 Ok(CallToolResult::success(vec![Content::text(json)]))
             }

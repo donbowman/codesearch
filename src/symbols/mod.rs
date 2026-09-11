@@ -48,6 +48,14 @@ pub struct FindImpactResult {
     pub resolved_symbol: Option<String>,
     /// Resolved references.
     pub references: Vec<SymbolReference>,
+    /// Completeness warnings for this answer. Non-empty means the
+    /// reference list may be INCOMPLETE — a helper failure was survived
+    /// rather than fatal (a project that would not compile, an exception
+    /// during reference resolution, a non-zero scip-typescript exit) and
+    /// the partial result was kept. Entries name what failed. Omitted when
+    /// empty: absent means the answer is as complete as the index knows.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     /// Seconds since the symbol index was last rebuilt.
     pub index_age_seconds: u64,
     /// Language that produced this result.
@@ -325,6 +333,10 @@ pub(crate) fn get_shared_scip_env(
                 &mut wtxn,
                 Some(crate::constants::SCIP_REF_CACHE_DB_NAME),
             )?;
+            env.create_database::<heed::types::Str, heed::types::Bytes>(
+                &mut wtxn,
+                Some(crate::constants::SCIP_REF_WARNINGS_DB_NAME),
+            )?;
             wtxn.commit()?;
             Ok(())
         },
@@ -400,6 +412,14 @@ pub trait SymbolIndexer: Send + Sync {
         db_path: &Path,
         canonical_key: &str,
     ) -> Result<Vec<SymbolReference>>;
+
+    /// Completeness warnings for one canonical key's stored answer — a
+    /// plain LMDB read, NEVER invoking a helper. Non-empty means the
+    /// references `find_references_for_key` returns for this key may be
+    /// INCOMPLETE: a partial helper run was survived and cached, and the
+    /// warnings were persisted with it so the partial answer can never
+    /// pass for complete. Entries name what failed.
+    fn lookup_warnings(&self, db_path: &Path, canonical: &str) -> Vec<String>;
 
     /// How old is the current symbol index (seconds since last rebuild)?
     fn index_age(&self, db_path: &Path) -> u64;
