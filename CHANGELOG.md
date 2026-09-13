@@ -14,6 +14,20 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.3.19]
+
+### Changed
+
+- **`find_impact` never silently picks a symbol or an adapter.** An ambiguous name (overloads, multiple definitions on one line) now returns a structured ambiguity envelope with sorted candidates instead of the shortest fuzzy match; an explicit `symbol_key` request field selects an exact candidate (mutually exclusive with `symbol_name` / `file`+`line`), and every resolved answer names its canonical key in the new additive `resolved_symbol` field. With more than one language index installed and no `language` given, the tool asks which one instead of silently using the first (todo #139).
+
+### Added
+
+- **`find_impact` surfaces partial results.** Index warnings — non-compiling C# projects, swallowed reference-resolution exceptions, `scip-typescript` non-zero exits with usable output — now persist (C#: alongside the cached refs in the same transaction; TS: in the index meta) and ride the answer as an additive `warnings` array instead of vanishing into the log, so consumers such as the `audit` binary's `impact`/`removals` never read incomplete evidence as zero (todo #139).
+
+### Fixed
+
+- **C# canonical symbol keys no longer collapse distinct declarations.** Generic arity (``M`1``), the full containing-type chain and fully qualified parameter types are part of the key again, so overloads that previously shared one identity keep their own. The index version is bumped to 2.0 with a key-format stamp in the index meta: a stale-format index reports as absent and rebuilds once on upgrade (todo #139).
+
 ## [1.3.16]
 
 ### Added

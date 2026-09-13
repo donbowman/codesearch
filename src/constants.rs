@@ -627,6 +627,19 @@ pub const SCIP_REBUILD_TIMESTAMP_KEY: &str = "last_rebuild_ts";
 /// (never written, or git could not be read at build time).
 pub const SCIP_HEAD_SHA_KEY: &str = "head_sha";
 
+/// LMDB metadata key recording which symbol-key format generation an index
+/// was built with. Written at every C# SCIP rebuild; `has_index` refuses an
+/// index whose value is absent or differs from [`SCIP_KEY_FORMAT`], so a
+/// change to the canonical key format forces exactly one rebuild instead of
+/// old-format keys being served as fresh.
+pub const SCIP_KEY_FORMAT_KEY: &str = "key_format";
+
+/// Current value written for [`SCIP_KEY_FORMAT_KEY`]. Bump whenever the
+/// canonical SCIP symbol key format produced by a language helper changes
+/// shape (B4: C# generic arity / containing-type path / fully qualified
+/// parameter types).
+pub const SCIP_KEY_FORMAT: &str = "2";
+
 /// LMDB table mapping `(file:line)` positions to `[symbol_keys]`.
 /// Used for O(1) position-based symbol lookup.
 pub const SCIP_POSITION_DB_NAME: &str = "scip_positions";
@@ -640,6 +653,15 @@ pub const SCIP_SIMPLE_NAMES_DB_NAME: &str = "scip_simple_names";
 /// format as `scip_symbols`). Populated on first `find_impact` call for a symbol;
 /// cleared when the definition index is rebuilt. Gives O(1) lookup on 2nd+ calls.
 pub const SCIP_REF_CACHE_DB_NAME: &str = "scip_ref_cache";
+
+/// LMDB table caching per-symbol completeness warnings from on-demand
+/// reference resolution (`scip-csharp find-refs` / `batch-find-refs`).
+/// Key: full SCIP symbol key. Value: `[v1, bincode(Vec<String>)]` (same wire
+/// format as the key lists). Non-empty means the cached references may be
+/// INCOMPLETE — a helper failure was survived rather than fatal. Empty
+/// warnings are REMOVED rather than stored, so absence means "complete" and
+/// a later clean re-resolution clears a stale warning.
+pub const SCIP_REF_WARNINGS_DB_NAME: &str = "scip_ref_warnings";
 
 /// Language identifier for the C# symbol indexer.
 /// Used as a key in `SymbolIndexerRegistry` lookups and TUI status maps.
@@ -661,6 +683,14 @@ pub const SCIP_TYPESCRIPT_REBUILD_TIMESTAMP_KEY: &str = "last_rebuild_ts:typescr
 /// TypeScript-specific key for `SCIP_HEAD_SHA_KEY` (the C# and TypeScript
 /// adapters share one `scip_meta` table, so keys are language-prefixed).
 pub const SCIP_TYPESCRIPT_HEAD_SHA_KEY: &str = "head_sha:typescript";
+
+/// TypeScript-specific key for the index-warnings entry: a JSON array of
+/// warnings from the LAST `scip-typescript` run. Non-empty means the index
+/// may be incomplete (the run exited non-zero and partial output was kept);
+/// an empty array is written on every clean rebuild so a successful reindex
+/// clears stale warnings. Absence (indexes written before this key existed)
+/// is read as complete — there is nothing to claim otherwise.
+pub const SCIP_TYPESCRIPT_INDEX_WARNINGS_KEY: &str = "index_warnings:typescript";
 
 /// Debounce window (ms) for the TypeScript file-watcher symbol rebuild.
 /// Mirrors `SCIP_CSHARP_DEBOUNCE_MS` — a single quiet-period flush avoids

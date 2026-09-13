@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 
 use codesearch::symbols::typescript::TypeScriptSymbolIndexer;
-use codesearch::symbols::{RebuildScope, SymbolIndexer};
+use codesearch::symbols::{ImpactQuery, KeyMatch, RebuildScope, SymbolIndexer};
 use tempfile::TempDir;
 
 #[test]
@@ -27,20 +27,20 @@ fn test_indexer_returns_empty_when_db_missing() {
     let age = indexer.index_age(&db_path);
     let _ = age; // open_scip_env creates the dir; just verify no panic.
 
-    // find_references with no data should return Ok(empty) because
-    // resolve_canonical_key returns None when no LMDB tables exist.
-    let result = indexer.find_references(&db_path, "add");
+    // resolve_query with no data should return NotFound because no LMDB
+    // tables exist.
+    let result = indexer.resolve_query(&db_path, &ImpactQuery::Name("add".into()));
     match result {
-        Ok(refs) => assert!(
-            refs.is_empty(),
-            "Should return empty vec when no SCIP data exists, got {:?}",
-            refs
+        Ok(key) => assert_eq!(
+            key,
+            KeyMatch::NotFound,
+            "Should not resolve when no SCIP data exists, got {key:?}"
         ),
         Err(e) => {
             // LMDB reopen failed (e.g. lock contention on CI). Acceptable —
             // the important invariant is that it never panics or returns
             // stale data.
-            eprintln!("Note: find_references returned Err (LMDB lock contention?): {e:#}");
+            eprintln!("Note: resolve_query returned Err (LMDB lock contention?): {e:#}");
         }
     }
 }
@@ -79,8 +79,8 @@ fn test_fixture_directory_shape() {
 
 /// Full pipeline integration test: scip-typescript subprocess → SCIP
 /// protobuf → LMDB → query, verifying that `find_impact`'s underlying
-/// `find_references()` returns ALL call-sites of a TS symbol across
-/// multiple files.
+/// `resolve_query()` + `find_references_for_key()` return ALL call-sites
+/// of a TS symbol across multiple files.
 ///
 /// Requires the `typescript_helper_integration` feature flag AND either:
 /// - `CODESEARCH_SCIP_TYPESCRIPT` env var pointing to a `scip-typescript`
@@ -120,9 +120,21 @@ fn test_typescript_pipeline_ts_sample_roundtrip() {
     // Fuzzy lookup: "add" should resolve to the `add` function in math.ts
     // and return the definition plus all call-sites across both files
     // that import and call it.
+    let resolved = indexer
+        .resolve_query(db_path, &ImpactQuery::Name("add".into()))
+        .expect("fuzzy resolution failed");
+    let canonical = match resolved {
+        KeyMatch::Resolved(k) => k,
+        other => panic!("fuzzy 'add' should resolve uniquely, got {other:?}"),
+    };
     let add_refs = indexer
-        .find_references(db_path, "add")
-        .expect("find_references failed");
+        .find_references_for_key(db_path, &canonical)
+        .expect("find_references_for_key failed");
+    // The answer must name the selected canonical identity.
+    assert!(
+        canonical.contains("add"),
+        "the resolved canonical key must identify `add`, got: {canonical}"
+    );
 
     let defs: Vec<_> = add_refs.iter().filter(|r| r.kind == "definition").collect();
     assert_eq!(defs.len(), 1, "Expected exactly 1 definition for `add`");
@@ -168,7 +180,7 @@ fn test_typescript_pipeline_ts_sample_roundtrip() {
 /// `CODESEARCH_TS_TEST_REAL` env var. Gated by the feature flag AND the env
 /// var, so it never runs in CI unless explicitly opted in.
 ///
-/// Verifies: rebuild succeeds on a non-trivial codebase, `find_references`
+/// Verifies: rebuild succeeds on a non-trivial codebase, `find_references_for_key`
 /// returns sensible multi-file results for a commonly-used symbol.
 #[test]
 #[cfg_attr(not(feature = "typescript_helper_integration"), ignore)]
@@ -217,13 +229,24 @@ fn test_typescript_pipeline_real_project() {
     // `log` is a very commonly used symbol in the target project — expect
     // many call-sites across many files.
     for sym in &["log", "configureLogger"] {
+        let resolved = indexer
+            .resolve_query(db_path, &ImpactQuery::Name((*sym).into()))
+            .unwrap_or_else(|e| panic!("resolve_query({sym}) failed: {e:#}"));
+        let canonical = match resolved {
+            KeyMatch::Resolved(k) => k,
+            KeyMatch::Ambiguous(candidates) => {
+                eprintln!("resolve_query({sym:?}) is ambiguous: {candidates:?}");
+                candidates[0].clone()
+            }
+            KeyMatch::NotFound => panic!("common symbol {sym} must resolve in a real project"),
+        };
         let refs = indexer
-            .find_references(db_path, sym)
-            .unwrap_or_else(|e| panic!("find_references({sym}) failed: {e:#}"));
+            .find_references_for_key(db_path, &canonical)
+            .unwrap_or_else(|e| panic!("find_references_for_key({canonical}) failed: {e:#}"));
         let distinct_files: std::collections::HashSet<_> =
             refs.iter().map(|r| r.file.clone()).collect();
         eprintln!(
-            "find_references({sym:?}): {} occurrences across {} files",
+            "find_references_for_key({canonical:?}): {} occurrences across {} files",
             refs.len(),
             distinct_files.len()
         );
@@ -234,10 +257,17 @@ fn test_typescript_pipeline_real_project() {
         );
     }
 
-    // Negative test: unknown symbol returns empty, no panic.
+    // Negative test: unknown symbol resolves NotFound, no panic.
     let unknown = indexer
-        .find_references(db_path, "thisSymbolDoesNotExist_xyzzy_12345")
-        .expect("find_references on unknown symbol should not error");
-    assert!(unknown.is_empty(), "Unknown symbol should return empty");
-    eprintln!("negative test OK: unknown symbol returned 0 results");
+        .resolve_query(
+            db_path,
+            &ImpactQuery::Name("thisSymbolDoesNotExist_xyzzy_12345".into()),
+        )
+        .expect("resolve_query on unknown symbol should not error");
+    assert_eq!(
+        unknown,
+        KeyMatch::NotFound,
+        "Unknown symbol should resolve NotFound"
+    );
+    eprintln!("negative test OK: unknown symbol reported NotFound");
 }

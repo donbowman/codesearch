@@ -1,7 +1,7 @@
 //! Tests for the resident-helper WorkspacePool (todo #115) — pure pool
 //! logic against a mock client, no real processes involved.
 
-use super::resident::{ClientLike, WorkspacePool};
+use super::resident::{ClientLike, ResidentRefs, WorkspacePool};
 use crate::symbols::SymbolReference;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -21,16 +21,19 @@ struct MockClient {
 }
 
 impl ClientLike for MockClient {
-    fn find_refs(&self, _symbol: &str) -> Result<Vec<SymbolReference>> {
+    fn find_refs(&self, _symbol: &str) -> Result<ResidentRefs> {
         if self.state.fail.load(Ordering::SeqCst) {
             anyhow::bail!("mock helper failed");
         }
-        Ok(vec![SymbolReference {
-            file: PathBuf::from("src/Mock.cs"),
-            start_line: 1,
-            end_line: 1,
-            kind: "reference".to_string(),
-        }])
+        Ok(ResidentRefs {
+            references: vec![SymbolReference {
+                file: PathBuf::from("src/Mock.cs"),
+                start_line: 1,
+                end_line: 1,
+                kind: "reference".to_string(),
+            }],
+            warnings: Vec::new(),
+        })
     }
 
     fn kill(&self) {
@@ -94,7 +97,7 @@ fn resident_pool_admission_evicts_lru_when_full() {
         .pool
         .find_refs(&PathBuf::from("h.exe"), &sln("c"), "Sym")
         .unwrap();
-    assert_eq!(refs.len(), 1);
+    assert_eq!(refs.references.len(), 1);
     assert_eq!(h.spawns.load(Ordering::SeqCst), 3);
     assert_eq!(h.state.kill_count.load(Ordering::SeqCst), 1);
     assert_eq!(h.state.live_children.load(Ordering::SeqCst), 2);
@@ -141,13 +144,13 @@ fn resident_pool_evicted_repo_respawns_and_answers() {
         .pool
         .find_refs(&PathBuf::from("h.exe"), &sln("b"), "Sym")
         .unwrap();
-    assert_eq!(refs.len(), 1);
+    assert_eq!(refs.references.len(), 1);
     // ...and coming back to the first repo must respawn and still answer.
     let refs = h
         .pool
         .find_refs(&PathBuf::from("h.exe"), &sln("a"), "Sym")
         .unwrap();
-    assert_eq!(refs.len(), 1);
+    assert_eq!(refs.references.len(), 1);
     assert_eq!(h.spawns.load(Ordering::SeqCst), 3);
 }
 
@@ -172,7 +175,7 @@ fn resident_pool_ttl_reaps_idle_workspaces_on_next_access() {
         .pool
         .find_refs(&PathBuf::from("h.exe"), &sln("b"), "Sym")
         .unwrap();
-    assert_eq!(refs.len(), 1);
+    assert_eq!(refs.references.len(), 1);
 }
 
 #[test]

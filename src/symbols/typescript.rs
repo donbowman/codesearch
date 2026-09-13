@@ -10,8 +10,8 @@
 //! `scip-typescript` emits full occurrences (definitions AND references) in a
 //! single indexing pass. Unlike the C# adapter (`csharp.rs`), there is no lazy
 //! `find-refs` subprocess and no `scip_ref_cache` table: `rebuild()` populates
-//! `scip_symbols` with everything up front, and `find_references()` /
-//! `find_references_by_position()` only ever read LMDB.
+//! `scip_symbols` with everything up front, and `resolve_query()` /
+//! `find_references_for_key()` only ever read LMDB.
 //!
 //! ## Incremental rebuild
 //!
@@ -30,11 +30,11 @@ use heed::Database;
 use serde::{Deserialize, Serialize};
 
 use super::scip_proto;
-use super::{RebuildScope, RebuildSummary, SymbolIndexer, SymbolReference};
+use super::{ImpactQuery, KeyMatch, RebuildScope, RebuildSummary, SymbolIndexer, SymbolReference};
 
 use crate::constants::{
     LANG_TYPESCRIPT, SCIP_POSITION_DB_NAME, SCIP_SIMPLE_NAMES_DB_NAME, SCIP_SYMBOLS_DB_NAME,
-    SCIP_TYPESCRIPT_HEAD_SHA_KEY, SCIP_TYPESCRIPT_HELPER_ENV,
+    SCIP_TYPESCRIPT_HEAD_SHA_KEY, SCIP_TYPESCRIPT_HELPER_ENV, SCIP_TYPESCRIPT_INDEX_WARNINGS_KEY,
     SCIP_TYPESCRIPT_REBUILD_TIMESTAMP_KEY,
 };
 
@@ -59,6 +59,10 @@ const META_REBUILD_TS: &str = SCIP_TYPESCRIPT_REBUILD_TIMESTAMP_KEY;
 
 /// Key in the meta database storing the git HEAD sha the index was built for.
 const META_HEAD_SHA: &str = SCIP_TYPESCRIPT_HEAD_SHA_KEY;
+
+/// Key in the meta database storing the index-completeness warnings (a JSON
+/// array) from the last `scip-typescript` run. Empty array = complete.
+const META_INDEX_WARNINGS: &str = SCIP_TYPESCRIPT_INDEX_WARNINGS_KEY;
 
 /// Key in the meta database storing the count of indexed symbols.
 const META_SYMBOL_COUNT: &str = "symbol_count:typescript";
@@ -278,13 +282,15 @@ impl TypeScriptSymbolIndexer {
     }
 
     /// Invoke `scip-typescript index` against `project_root`, writing the SCIP
-    /// protobuf index to `output_path`.
+    /// protobuf index to `output_path`. Returns the completeness warning when
+    /// the run exited non-zero (partial output is acceptable, mirroring the
+    /// C# adapter) — the caller persists it so the partial index stays honest.
     fn invoke_index_helper(
         &self,
         invocation: &HelperInvocation,
         project_root: &Path,
         output_path: &Path,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let mut cmd = match invocation {
             HelperInvocation::Direct(path) => Command::new(path),
             HelperInvocation::Npx => {
@@ -345,50 +351,62 @@ impl TypeScriptSymbolIndexer {
         }
 
         if !output.status.success() {
-            tracing::warn!(
-                "scip-typescript exited with {} for {}",
+            let warning = format!(
+                "scip-typescript exited with {} for {} — index may be incomplete",
                 output.status,
                 project_root.display()
             );
-            // Don't bail — partial output is acceptable, mirroring the C# adapter.
+            tracing::warn!("{warning}");
+            // Don't bail — partial output is acceptable, mirroring the C#
+            // adapter — but the warning travels to the caller, which
+            // persists it so the partial index can never pass for complete.
+            return Ok(Some(warning));
         }
 
-        Ok(())
+        Ok(None)
     }
 
-    /// Resolve a user-supplied symbol query to a canonical SCIP symbol key.
+    /// Resolve a user-supplied symbol query to canonical SCIP key(s).
     /// Exact match first, then fuzzy match via the simple-name index.
-    fn resolve_canonical_key(&self, env: &TrackedEnv, symbol: &str) -> Result<Option<String>> {
+    ///
+    /// Several fuzzy matches come back as `KeyMatch::Ambiguous` — the old
+    /// behaviour silently picked the shortest candidate, which hid
+    /// overloads from the caller.
+    fn resolve_name_key(&self, env: &TrackedEnv, symbol: &str) -> Result<KeyMatch> {
         let rtxn = env.read_txn()?;
 
         let symbols_db: Database<Str, Bytes> = match env.open_database(&rtxn, Some(SCIP_DB_NAME))? {
             Some(db) => db,
-            None => return Ok(None),
+            None => return Ok(KeyMatch::NotFound),
         };
 
         if symbols_db.get(&rtxn, symbol)?.is_some() {
-            return Ok(Some(symbol.to_string()));
+            return Ok(KeyMatch::Resolved(symbol.to_string()));
         }
 
         let simple_names_db: Database<Str, Bytes> =
             match env.open_database(&rtxn, Some(SCIP_NAMES_DB_NAME))? {
                 Some(db) => db,
-                None => return Ok(None),
+                None => return Ok(KeyMatch::NotFound),
             };
 
         let simple = extract_simple_name(symbol);
         let candidates: Vec<String> = match simple_names_db.get(&rtxn, &simple as &str)? {
             Some(b) => deserialize_keys_v1(b)?,
-            None => return Ok(None),
+            None => return Ok(KeyMatch::NotFound),
         };
 
-        let chosen = candidates
-            .iter()
+        let mut matches: Vec<String> = candidates
+            .into_iter()
             .filter(|k| fuzzy_symbol_match(symbol, k))
-            .min_by_key(|k| k.len())
-            .cloned();
-
-        Ok(chosen)
+            .collect();
+        matches.sort();
+        matches.dedup();
+        Ok(match matches.len() {
+            0 => KeyMatch::NotFound,
+            1 => KeyMatch::Resolved(matches.pop().expect("len checked")),
+            _ => KeyMatch::Ambiguous(matches),
+        })
     }
 }
 
@@ -458,7 +476,7 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
         }
         let _output_guard = TempFileGuard(output_path.clone());
 
-        self.invoke_index_helper(&invocation, repo_path, &output_path)?;
+        let index_warning = self.invoke_index_helper(&invocation, repo_path, &output_path)?;
 
         let index_data = std::fs::read(&output_path)
             .with_context(|| format!("Failed to read SCIP index at {}", output_path.display()))?;
@@ -566,6 +584,17 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
         if let Some(sha) = super::current_git_head(repo_path) {
             meta_db.put(&mut wtxn, META_HEAD_SHA, sha.as_str())?;
         }
+        // Persist index completeness as a JSON array. ALWAYS written — also
+        // on a clean run, as an empty array — so a successful reindex clears
+        // stale warnings instead of leaving a fixed index claiming partiality.
+        let index_warnings: Vec<String> = index_warning.into_iter().collect();
+        meta_db.put(
+            &mut wtxn,
+            META_INDEX_WARNINGS,
+            serde_json::to_string(&index_warnings)
+                .context("Failed to serialize TypeScript index warnings")?
+                .as_str(),
+        )?;
 
         wtxn.commit()?;
 
@@ -585,16 +614,65 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
         })
     }
 
-    fn find_references(&self, db_path: &Path, symbol: &str) -> Result<Vec<SymbolReference>> {
-        let env = self.open_scip_env(db_path)?;
-
-        let canonical = match self.resolve_canonical_key(&env, symbol)? {
-            Some(k) => k,
-            None => {
-                tracing::debug!("Symbol '{}' not found in TypeScript index", symbol);
-                return Ok(vec![]);
+    fn resolve_query(&self, db_path: &Path, query: &ImpactQuery) -> Result<KeyMatch> {
+        match query {
+            ImpactQuery::ExactKey(key) => {
+                // Explicit selection: presence check only, no fuzzy
+                // fallback. A key that is not in the index is NotFound —
+                // the handler turns that into a loud failure, never a
+                // guess at a near-miss symbol.
+                let env = self.open_scip_env(db_path)?;
+                let rtxn = env.read_txn()?;
+                let present = match env.open_database::<Str, Bytes>(&rtxn, Some(SCIP_DB_NAME))? {
+                    Some(db) => db.get(&rtxn, key as &str)?.is_some(),
+                    None => false,
+                };
+                Ok(if present {
+                    KeyMatch::Resolved(key.clone())
+                } else {
+                    KeyMatch::NotFound
+                })
             }
-        };
+            ImpactQuery::Name(name) => {
+                let env = self.open_scip_env(db_path)?;
+                self.resolve_name_key(&env, name)
+            }
+            ImpactQuery::Position { file, line } => {
+                let env = self.open_scip_env(db_path)?;
+                let rtxn = env.read_txn()?;
+
+                let positions_db: Database<Str, Bytes> = env
+                    .open_database(&rtxn, Some(SCIP_POS_DB_NAME))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Position index not found. Run a rebuild first.")
+                    })?;
+
+                let pos_key = format!("{}:{}", file.to_string_lossy().replace('\\', "/"), line);
+
+                let mut candidates: Vec<String> = match positions_db.get(&rtxn, &pos_key as &str)? {
+                    Some(b) => deserialize_keys_v1(b)?,
+                    None => return Ok(KeyMatch::NotFound),
+                };
+                candidates.sort();
+                candidates.dedup();
+
+                // Several symbols on one line are ambiguity, not a licence
+                // to pick the shortest.
+                Ok(match candidates.len() {
+                    0 => KeyMatch::NotFound,
+                    1 => KeyMatch::Resolved(candidates.pop().expect("len checked")),
+                    _ => KeyMatch::Ambiguous(candidates),
+                })
+            }
+        }
+    }
+
+    fn find_references_for_key(
+        &self,
+        db_path: &Path,
+        canonical_key: &str,
+    ) -> Result<Vec<SymbolReference>> {
+        let env = self.open_scip_env(db_path)?;
 
         let rtxn = env.read_txn()?;
         let symbols_db: Database<Str, Bytes> = match env.open_database(&rtxn, Some(SCIP_DB_NAME))? {
@@ -602,7 +680,7 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
             None => return Ok(vec![]),
         };
 
-        let stored = match symbols_db.get(&rtxn, &canonical)? {
+        let stored = match symbols_db.get(&rtxn, canonical_key)? {
             Some(bytes) => deserialize_refs(bytes)?,
             None => return Ok(vec![]),
         };
@@ -618,34 +696,25 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
             .collect())
     }
 
-    fn find_references_by_position(
-        &self,
-        db_path: &Path,
-        file: &Path,
-        line: u32,
-    ) -> Result<Vec<SymbolReference>> {
-        let env = self.open_scip_env(db_path)?;
-        let rtxn = env.read_txn()?;
-
-        let positions_db: Database<Str, Bytes> = env
-            .open_database(&rtxn, Some(SCIP_POS_DB_NAME))?
-            .ok_or_else(|| anyhow::anyhow!("Position index not found. Run a rebuild first."))?;
-
-        let pos_key = format!("{}:{}", file.to_string_lossy().replace('\\', "/"), line);
-
-        let candidate_keys: Vec<String> = match positions_db.get(&rtxn, &pos_key as &str)? {
-            Some(b) => deserialize_keys_v1(b)?,
-            None => return Ok(vec![]),
+    fn lookup_warnings(&self, db_path: &Path, _canonical: &str) -> Vec<String> {
+        // Plain LMDB read — never a helper invocation. The meta entry is
+        // per-INDEX, not per-symbol (scip-typescript has no per-symbol
+        // resolution), so every canonical key of this index reports the
+        // same warnings. Absence (pre-warnings indexes) reads as complete.
+        let Some(env) = self.open_scip_env(db_path).ok() else {
+            return Vec::new();
         };
-
-        let chosen = candidate_keys.iter().min_by_key(|k| k.len()).cloned();
-        drop(rtxn);
-        drop(env);
-
-        match chosen {
-            Some(k) => self.find_references(db_path, &k),
-            None => Ok(vec![]),
-        }
+        let Ok(rtxn) = env.read_txn() else {
+            return Vec::new();
+        };
+        let raw = match env.open_database::<Str, Str>(&rtxn, Some(SCIP_META_DB_NAME)) {
+            Ok(Some(meta)) => match meta.get(&rtxn, META_INDEX_WARNINGS) {
+                Ok(Some(raw)) => raw,
+                _ => return Vec::new(),
+            },
+            _ => return Vec::new(),
+        };
+        serde_json::from_str(raw).unwrap_or_default()
     }
 
     fn index_age(&self, db_path: &Path) -> u64 {
@@ -780,3 +849,9 @@ mod tests {
         // `tmp` dropped at end of scope → dir removed even on panic.
     }
 }
+
+/// Ambiguity-resolution tests for `resolve_query` (hand-populated LMDB —
+/// no helper). Sibling `_tests.rs` file per repo convention.
+#[cfg(test)]
+#[path = "typescript_tests.rs"]
+mod typescript_tests;

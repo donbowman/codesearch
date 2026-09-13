@@ -105,8 +105,14 @@ impl CodesearchService {
     /// or `CODESEARCH_SCIP_TYPESCRIPT`). If no backend is installed for the target
     /// language, the response reports it — fall back to `find` with `kind="usages"`
     /// (lexical) only then.
+    ///
+    /// Ambiguity contract: when several stored symbols match a name or a position
+    /// (overloads, same-line definitions), the answer is a typed `{"ambiguous": true,
+    /// "candidates": [...]}` envelope — the server never silently picks one. Re-call
+    /// with `symbol_key` set to exactly one candidate. Every resolved answer names the
+    /// selected canonical key in `resolved_symbol`.
     #[tool(
-        description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nThe right tool for \"who calls X?\" / \"what breaks if I rename X?\". Returns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands language semantics.\n\nInput variants:\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n\nPrecision backends (SCIP) ship per language; C# (bundled `scip-csharp` helper, `-with-csharp` releases) and TypeScript (via `npx` or `CODESEARCH_SCIP_TYPESCRIPT`) are available today. For Rust/Python/Go/etc., use `find` with `kind=\"usages\"` as a text-based fallback until SCIP backends for those languages ship.\n\nOn a busy answer (`\"busy\": true`): sleep `retry_after_seconds` and retry the SAME call. Busy is progress, not failure — never fall back to text search on busy.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
+        description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nThe right tool for \"who calls X?\" / \"what breaks if I rename X?\". Returns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands language semantics.\n\nInput variants (mutually exclusive):\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n- By exact canonical key: `{ \"symbol_key\": \"csharp . . . FieldDefinition#Validate().\", \"project\": \"myrepo\" }`\n\nAMBIGUITY: if several stored symbols match (overloads, same-line definitions), the answer is `{\"ambiguous\": true, \"query\": ..., \"candidates\": [...]}` — pick one candidate and re-call with `symbol_key` set to it verbatim. A resolved answer names the selected canonical key in `resolved_symbol`; never assume which overload answered.\n\nWARNINGS: a resolved answer may carry a `\"warnings\": [\"...\"]` array — non-empty means the reference list may be INCOMPLETE because a helper failure was survived rather than fatal (a project that failed to compile, an exception during reference resolution, a non-zero scip-typescript exit). Each entry names what failed. Treat warnings as a prompt to reindex the project (or cross-check with `find` `kind=\"usages\"`) before concluding \"no callers\" — absent or empty means the answer is as complete as the index knows.\n\nLANGUAGE: if `language` is omitted, position lookups auto-detect it from the file extension; with several SCIP helpers installed the answer asks you to name one — pass `language` to avoid the round-trip.\n\nPrecision backends (SCIP) ship per language; C# (bundled `scip-csharp` helper, `-with-csharp` releases) and TypeScript (via `npx` or `CODESEARCH_SCIP_TYPESCRIPT`) are available today. For Rust/Python/Go/etc., use `find` with `kind=\"usages\"` as a text-based fallback until SCIP backends for those languages ship.\n\nOn a busy answer (`\"busy\": true`): sleep `retry_after_seconds` and retry the SAME call. Busy is progress, not failure — never fall back to text search on busy.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
     )]
     async fn find_impact(
         &self,
@@ -121,15 +127,28 @@ impl CodesearchService {
             request.project,
         );
 
-        // Validate input: must provide either symbol_name or file+line
+        // Validate input: exactly one of symbol_key / symbol_name / file+line.
         let has_name = request
             .symbol_name
             .as_ref()
             .is_some_and(|s| !s.trim().is_empty());
         let has_position = request.file.is_some() && request.line.is_some();
-        if !has_name && !has_position {
+        let has_key = request
+            .symbol_key
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty());
+        if !has_name && !has_position && !has_key {
             return Ok(CallToolResult::success(vec![Content::text(
-                "Must provide either `symbol_name` or both `file` and `line` for position-based lookup.".to_string(),
+                "Must provide `symbol_name`, both `file` and `line`, or an exact `symbol_key`."
+                    .to_string(),
+            )]));
+        }
+        // An explicit key IS the selection; combining it with a fuzzy query
+        // would let silent precedence decide the answer — the thing this
+        // contract exists to remove. Reject instead.
+        if has_key && (has_name || has_position) {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "`symbol_key` is mutually exclusive with `symbol_name` and `file`+`line`: pass only the explicit selection.".to_string(),
             )]));
         }
 
@@ -187,14 +206,22 @@ impl CodesearchService {
                 }
             },
             None => {
-                // No language specified and couldn't auto-detect — try all installed
+                // No language given and none detectable from a file path.
                 let installed = registry.installed_languages();
                 if installed.is_empty() {
                     return Ok(CallToolResult::success(vec![Content::text(
                         "No symbol indexers installed. Install the `scip-csharp` helper for C# support, or `scip-typescript` (via npx) for TypeScript support.".to_string(),
                     )]));
                 }
-                // Use the first installed language (MVP: C# or TypeScript)
+                if installed.len() > 1 {
+                    // Several helpers installed: answering from one silently is
+                    // the same silent pick the ambiguity contract removes. Ask.
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Several symbol indexes are installed ({}). Pass `language` (e.g. \"csharp\") so the lookup cannot silently answer from the wrong one.",
+                        installed.join(", ")
+                    ))]));
+                }
+                // Exactly one installed: the pick is deterministic.
                 match registry.get(&installed[0]) {
                     Some(i) => i,
                     None => {
@@ -224,7 +251,7 @@ impl CodesearchService {
 
         // Perform the lookup under an internal wall-clock budget.
         //
-        // `find_references` may invoke `scip-csharp find-refs` on a cache miss
+        // `find_references_for_key` may invoke `scip-csharp find-refs` on a cache miss
         // (lazy Opt-2 reference resolution). That subprocess can take several minutes
         // on a large solution. The call therefore runs on `spawn_blocking` (it never
         // blocks an async worker thread) and is raced against
@@ -234,26 +261,41 @@ impl CodesearchService {
         // in LMDB, so the hinted retry is served warm; the lookup tracker
         // (find_impact_tracker) makes that retry observe progress or the warm
         // result explicitly instead of re-running the helper.
-        let language_for_lookup = indexer.language().to_string();
-        let symbol_name_for_lookup = request.symbol_name.clone();
-        let line_for_lookup = request.line;
-        let file_for_pos = if !has_name {
-            Some(self.normalize_symbol_query_path(
-                &project_root,
-                Path::new(request.file.as_ref().unwrap()),
-            ))
-        } else {
-            None
-        };
-        let what = if has_name {
-            format!("'{}'", symbol_name_for_lookup.as_deref().unwrap_or("?"))
-        } else {
-            format!(
-                "{}:{}",
-                request.file.as_deref().unwrap_or("?"),
-                line_for_lookup.unwrap_or(0)
+        // Build the typed query. The validation above guarantees exactly
+        // one input form, so there is no precedence to guess at.
+        let query = if has_key {
+            crate::symbols::ImpactQuery::ExactKey(
+                request.symbol_key.clone().expect("has_key checked"),
             )
+        } else if has_name {
+            crate::symbols::ImpactQuery::Name(
+                request.symbol_name.clone().expect("has_name checked"),
+            )
+        } else {
+            crate::symbols::ImpactQuery::Position {
+                file: self.normalize_symbol_query_path(
+                    &project_root,
+                    Path::new(request.file.as_ref().expect("has_position checked")),
+                ),
+                line: request.line.expect("has_position checked"),
+            }
         };
+        let what = match &query {
+            crate::symbols::ImpactQuery::Name(n) => format!("'{n}'"),
+            crate::symbols::ImpactQuery::ExactKey(k) => k.clone(),
+            crate::symbols::ImpactQuery::Position { file, line } => {
+                format!("{}:{}", file.display(), line)
+            }
+        };
+        // The echo the response's `symbol` field has always carried — the
+        // query as asked. The selected identity travels in `resolved_symbol`
+        // from here on; the echo never claimed to be one.
+        let echo = what
+            .trim_start_matches('\'')
+            .trim_end_matches('\'')
+            .to_string();
+
+        let language_for_lookup = indexer.language().to_string();
         let busy_state = format!(
             "resolving {} via the {} SCIP helper (cold reference cache)",
             what, language_for_lookup
@@ -274,16 +316,15 @@ impl CodesearchService {
         // Shared result construction: the warm-retry path (below) must be
         // byte-identical to a budget-fast completion, so both build the
         // response through this one closure.
-        let build_impact =
-            |references: Vec<crate::symbols::SymbolReference>| crate::symbols::FindImpactResult {
-                symbol: request.symbol_name.clone().unwrap_or_else(|| {
-                    format!(
-                        "{}:{}",
-                        request.file.as_deref().unwrap_or("?"),
-                        request.line.unwrap_or(0)
-                    )
-                }),
+        let build_impact = |references: Vec<crate::symbols::SymbolReference>,
+                            resolved_symbol: Option<String>,
+                            warnings: Vec<String>|
+         -> crate::symbols::FindImpactResult {
+            crate::symbols::FindImpactResult {
+                symbol: echo.clone(),
+                resolved_symbol,
                 references: dedupe_references(references),
+                warnings,
                 index_age_seconds: indexer.index_age(&db_path),
                 language: indexer.language().to_string(),
                 scope: ctx
@@ -292,7 +333,86 @@ impl CodesearchService {
                     .unwrap_or_else(|| "local".to_string()),
                 index_head_sha: indexer.index_head_sha(&db_path),
                 current_head_sha: current_head_sha.clone(),
-            };
+            }
+        };
+
+        // Resolution: plain LMDB reads, run off the async runtime like every
+        // blocking call. Ambiguity surfaces HERE — before any expensive
+        // helper invocation — as a typed candidates answer; the server never
+        // silently picks among the query's matches (the old behaviour took
+        // the shortest fuzzy candidate and answered about the wrong symbol).
+        let registry_for_resolve = self.symbol_registry.clone();
+        let language_for_resolve = language_for_lookup.clone();
+        let db_path_for_resolve = db_path.clone();
+        let query_for_resolve = query.clone();
+        let resolution = match tokio::task::spawn_blocking(move || {
+            let indexer = registry_for_resolve
+                .get(&language_for_resolve)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "symbol indexer for '{}' disappeared mid-request",
+                        language_for_resolve
+                    )
+                })?;
+            indexer.resolve_query(&db_path_for_resolve, &query_for_resolve)
+        })
+        .await
+        {
+            Ok(inner) => inner,
+            // The handler returns an MCP error type, not anyhow::Error, so
+            // a JoinError is folded into the lookup-failure path below
+            // (classified stale/failed by the index age) instead of `?`.
+            Err(e) => Err(anyhow::anyhow!("symbol resolve task failed: {e:#}")),
+        };
+
+        let canonical = match resolution {
+            Err(e) => {
+                let failure = crate::symbols::SymbolLookupFailure::classify(
+                    format!("{e:#}"),
+                    indexer.index_age(&db_path),
+                );
+                let json =
+                    serde_json::to_string(&failure).unwrap_or_else(|_| failure.error.clone());
+                return Ok(CallToolResult::success(vec![Content::text(json)]));
+            }
+            Ok(crate::symbols::KeyMatch::Ambiguous(candidates)) => {
+                let ambiguity = crate::symbols::SymbolAmbiguity {
+                    ambiguous: true,
+                    query: what,
+                    candidates,
+                    hint_for_agent: "Several stored symbols match this query. Re-call find_impact with `symbol_key` set to exactly one of `candidates`, verbatim.".to_string(),
+                };
+                let json = serde_json::to_string(&ambiguity)
+                    .unwrap_or_else(|_| "{\"ambiguous\":true}".to_string());
+                return Ok(CallToolResult::success(vec![Content::text(json)]));
+            }
+            Ok(crate::symbols::KeyMatch::NotFound) if has_key => {
+                // An explicit key that misses is a loud failure, not an
+                // empty answer: the caller selected that key deliberately,
+                // so a miss means the answer it came from and the index
+                // have drifted apart.
+                let failure = crate::symbols::SymbolLookupFailure {
+                    error: format!(
+                        "symbol_key '{}' is not in the {} index",
+                        echo, language_for_lookup
+                    ),
+                    class: crate::symbols::SymbolLookupFailureClass::Failed,
+                    hint_for_agent: "The index was likely rebuilt since the ambiguous answer. Re-run the original name or position query to list the current candidates instead of retrying the key."
+                        .to_string(),
+                };
+                let json =
+                    serde_json::to_string(&failure).unwrap_or_else(|_| failure.error.clone());
+                return Ok(CallToolResult::success(vec![Content::text(json)]));
+            }
+            Ok(crate::symbols::KeyMatch::NotFound) => {
+                // Preserve the historical contract for fuzzy queries: an
+                // unresolvable name/position answers empty references.
+                let impact = build_impact(Vec::new(), None, Vec::new());
+                let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
+                return Ok(CallToolResult::success(vec![Content::text(json)]));
+            }
+            Ok(crate::symbols::KeyMatch::Resolved(canonical)) => canonical,
+        };
 
         // Background continuation: consult the tracker before starting a
         // (potentially cold, minutes-long) lookup. A retry of an overran
@@ -327,7 +447,10 @@ impl CodesearchService {
                     references.len(),
                     busy_state
                 );
-                let impact = build_impact(references);
+                // The warm retry must carry the same honesty as a fresh
+                // answer: read the persisted warnings for this key.
+                let warnings = indexer.lookup_warnings(&db_path, &canonical);
+                let impact = build_impact(references, Some(canonical.clone()), warnings);
                 let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
                 return Ok(CallToolResult::success(vec![Content::text(json)]));
             }
@@ -347,7 +470,7 @@ impl CodesearchService {
 
         let registry_for_lookup = self.symbol_registry.clone();
         let db_path_for_lookup = db_path.clone();
-        let file_for_lookup = file_for_pos;
+        let canonical_for_lookup = canonical.clone();
         let lookup_entry = find_impact_tracker::IMPACT_LOOKUP_TRACKER.register(tracker_key.clone());
         let lookup_entry_in_task = lookup_entry;
         let lookup = async move {
@@ -360,18 +483,8 @@ impl CodesearchService {
                             language_for_lookup
                         )
                     })?;
-                let result = if has_name {
-                    indexer.find_references(
-                        &db_path_for_lookup,
-                        symbol_name_for_lookup.as_deref().unwrap_or(""),
-                    )
-                } else {
-                    indexer.find_references_by_position(
-                        &db_path_for_lookup,
-                        &file_for_lookup.unwrap_or_default(),
-                        line_for_lookup.unwrap_or(0),
-                    )
-                };
+                let result =
+                    indexer.find_references_for_key(&db_path_for_lookup, &canonical_for_lookup);
                 // Record INSIDE the blocking task: the handler's awaiting
                 // future is dropped at budget overrun, but this detached
                 // task survives and the recorded outcome is what the hinted
@@ -390,7 +503,10 @@ impl CodesearchService {
                 // Completed within the budget: nothing is in flight, so a
                 // later lookup must consult the real cache, not the tracker.
                 find_impact_tracker::IMPACT_LOOKUP_TRACKER.remove(&tracker_key);
-                let impact = build_impact(references);
+                // Surface what the lookup survived: a partial answer must
+                // say so in its own payload, not only in a log line.
+                let warnings = indexer.lookup_warnings(&db_path, &canonical);
+                let impact = build_impact(references, Some(canonical), warnings);
                 let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
                 Ok(CallToolResult::success(vec![Content::text(json)]))
             }
