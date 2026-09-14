@@ -49,6 +49,14 @@ echo more >> AGENTS.develop.md && stage AGENTS.develop.md
 assert "develop: AGENTS.develop.md allowed" 0 "$(run_guard; echo $?)"
 unstage_all
 
+echo "== pre-merge-commit hook: executed, not just wired =="
+stage AGENTS.md
+bash "$HOOKS/pre-merge-commit" >/dev/null 2>&1
+assert "pre-merge-commit blocks staged AGENTS.md on develop" 1 "$?"
+unstage_all
+bash "$HOOKS/pre-merge-commit" >/dev/null 2>&1
+assert "pre-merge-commit passes with a clean index on develop" 0 "$?"
+
 echo "== guard: feature branch allows agent files, blocks strays =="
 git checkout -qb feature/x
 stage AGENTS.md CLAUDE.md

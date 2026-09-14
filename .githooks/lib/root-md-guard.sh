@@ -19,11 +19,12 @@
 # bash (not sh): process substitution. macOS bash 3.2 compatible.
 
 root_md_guard() {
-    # git branch --show-current: empty output on detached HEAD and unborn HEAD.
-    # (rev-parse --abbrev-ref would print "HEAD" when detached — creating
-    # branch-local files there would later block rebase/bisect checkouts of
-    # commits that track them — and exits 128 on unborn HEAD, killing a
-    # set -e caller mid-hook.)
+    # git branch --show-current: empty on detached HEAD (unborn HEAD prints
+    # the branch name — harmless feature-branch treatment). rev-parse
+    # --abbrev-ref would print "HEAD" when detached — creating branch-local
+    # files there would later block rebase/bisect checkouts of commits that
+    # track them — and exits 128 on unborn HEAD, killing a set -e caller
+    # mid-hook.
     BRANCH=$(git branch --show-current 2>/dev/null || true)
     case "$BRANCH" in
         develop|master)

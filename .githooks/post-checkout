@@ -21,9 +21,11 @@ CLAUDE_MD="CLAUDE.md"
 
 BRANCH=$(git branch --show-current 2>/dev/null)
 
-# Empty on detached HEAD (bisect/rebase steps) and unborn HEAD — no lifecycle
-# there: files created on a detached HEAD would block later checkouts of any
-# commit that tracks them ("untracked working tree files would be overwritten").
+# Empty on detached HEAD (bisect/rebase steps) — no lifecycle there: files
+# created on a detached HEAD would block later checkouts of any commit that
+# tracks them ("untracked working tree files would be overwritten").
+# (On unborn HEAD git prints the branch name — harmless feature-branch
+# treatment, self-heals on the next develop/master checkout.)
 [ -n "$BRANCH" ] || exit 0
 
 case "$BRANCH" in

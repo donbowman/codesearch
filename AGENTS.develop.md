@@ -41,7 +41,9 @@ travels through the PR and survives branch switches.
 
 Enforced mechanically (forgetting step 4 cannot leak the files):
 - `pre-commit` rejects introducing root `AGENTS.md`/`CLAUDE.md` on
-  `develop`/`master` — including merge commits that would re-add them.
+  `develop`/`master` (direct commits and conflict resolutions).
+- `pre-merge-commit` runs the same guard on the merge result — a clean
+  merge never invokes pre-commit.
 - The `agent-files-check` CI workflow flags any PR into `develop`/`master`
   whose head still carries them.
 
