@@ -18,6 +18,23 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+// ── Helper rendering ──────────────────────────────────────────────
+
+/// Platform-stable rendering of a helper process's exit status.
+///
+/// `ExitStatus`'s `Display` prints `exit code: N` on Windows but
+/// `exit status: N` on Unix — text that is persisted into index meta
+/// tables and asserted by tests must not depend on the host OS (the
+/// Linux CI red after #238 was exactly this drift). Signal-terminated
+/// processes (Unix `code() == None`) have no portable code and fall
+/// back to the platform's own rendering.
+pub(crate) fn exit_status_text(status: &std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit code: {code}"),
+        None => status.to_string(),
+    }
+}
+
 // ── Common types ──────────────────────────────────────────────────
 
 /// A resolved reference to a symbol — file, line range, and kind.
