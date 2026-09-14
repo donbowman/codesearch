@@ -26,6 +26,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 ### Fixed
 
+- **Persisted helper-exit warnings are platform-stable — Linux CI green again.** `ExitStatus`'s `Display` renders `exit code: N` on Windows but `exit status: N` on Unix, so the non-zero-exit warning the TypeScript symbol indexer persists into its meta table disagreed with its own regression test on Linux, failing `test-linux`/`csharp-integration-tests` deterministically since #238. A shared `exit_status_text()` renders `exit code: N` on every platform (signal-terminated processes fall back to the platform string), applied to the persisted TS warning and the C#/TS helper log lines, pinned by a cross-platform unit test.
+
 - **C# canonical symbol keys no longer collapse distinct declarations.** Generic arity (``M`1``), the full containing-type chain and fully qualified parameter types are part of the key again, so overloads that previously shared one identity keep their own. The index version is bumped to 2.0 with a key-format stamp in the index meta: a stale-format index reports as absent and rebuilds once on upgrade (todo #139).
 
 ## [1.3.16]

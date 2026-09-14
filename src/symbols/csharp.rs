@@ -569,7 +569,11 @@ impl CSharpSymbolIndexer {
         }
 
         if !status.success() {
-            tracing::warn!("scip-csharp exited with {} for {}", status, solution_short);
+            tracing::warn!(
+                "scip-csharp exited with {} for {}",
+                super::exit_status_text(&status),
+                solution_short
+            );
             // Don't bail — partial output is acceptable per AGENTS.md spec
         }
 
@@ -664,7 +668,7 @@ impl CSharpSymbolIndexer {
         if !status.success() {
             tracing::warn!(
                 "scip-csharp find-refs exited with {} for '{}'",
-                status,
+                super::exit_status_text(&status),
                 symbol
             );
         }
@@ -1152,7 +1156,7 @@ impl CSharpSymbolIndexer {
         if !status.success() {
             tracing::warn!(
                 "scip-csharp batch-find-refs exited with {} for {}",
-                status,
+                super::exit_status_text(&status),
                 solution_short
             );
             // Don't bail — partial output is acceptable

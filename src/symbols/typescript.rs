@@ -353,7 +353,7 @@ impl TypeScriptSymbolIndexer {
         if !output.status.success() {
             let warning = format!(
                 "scip-typescript exited with {} for {} — index may be incomplete",
-                output.status,
+                super::exit_status_text(&output.status),
                 project_root.display()
             );
             tracing::warn!("{warning}");

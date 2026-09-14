@@ -177,6 +177,7 @@ TUI `i` overlay. The TUI discovery tick is config-only (zero HTTP).
 
 - **Branch from develop**, never from master. Feature branches: `features/<name>` (or `fix/`, `chore/`).
 - **Cargo.toml version** on develop may be one version ahead of the deployed binary — that is expected due to `copy-to-common.ps1` deploy hook. Never flag as inconsistency.
+- **Always fix bugs you encounter — including pre-existing ones** the current branch did not introduce. Clean code and tests are the bar: a fix lands with a test that fails without it (reintroduce the defect, watch it fail — the proof rule under *Search errors*).
 - **Never write separate `AGENTS_xxx.md` sibling files** unless explicitly requested. OpenCode reads `AGENTS.md` only. Out-of-repo planning goes to `C:\WorkArea\AI\codesearch\instructions\`.
 - **Root file hygiene (markdown)**: root markdown is allowlisted — `AGENTS.develop.md`, `README.md`, `README_CSharp.md`, `CHANGELOG.md`, `RELEASING.md` always; `AGENTS.md` and `CLAUDE.md` on **feature branches only** (branch-local, dropped at finalization — the pre-commit guard rejects them on `develop`/`master`). Anything else (diagnoses, plans, test scenarios, worklogs) goes into `.docs/` (gitignored, local-only). Enforced by the `pre-commit` root-md allowlist guard and the `agent-files-check` CI workflow.
 - **Path normalization**: all path comparisons must go through a single normalize utility. Windows UNC prefixes (`\\?\C:\`), backslash/forward-slash mismatches, and worktree `.git` file resolution have each caused subtle bugs in the past.

@@ -316,3 +316,15 @@ fn rebuild_persists_the_nonzero_exit_warning_into_the_meta_table() {
         warnings[0]
     );
 }
+
+#[test]
+fn exit_status_text_is_platform_stable() {
+    // ExitStatus's Display prints "exit code: N" on Windows but
+    // "exit status: N" on Unix — persisted warning text (and the test
+    // above) must not drift with the host OS. Pin the helper on both.
+    #[cfg(unix)]
+    let status = std::os::unix::process::ExitStatusExt::from_raw(3 << 8);
+    #[cfg(windows)]
+    let status = std::os::windows::process::ExitStatusExt::from_raw(3);
+    assert_eq!(crate::symbols::exit_status_text(&status), "exit code: 3");
+}
