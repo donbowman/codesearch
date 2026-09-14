@@ -380,36 +380,23 @@ fn test_csharp_pipeline_smallsolution_roundtrip() {
     let defs: Vec<_> = add_refs.iter().filter(|r| r.kind == "definition").collect();
     assert_eq!(defs.len(), 1, "Expected 1 definition for Calculator.Add");
 
-    // Fuzzy query: "Add" should resolve to exactly Calculator.Add
+    // Ambiguity contract: "Add" has two overloads — the adapter must list
+    // them, never pick one silently (the #238 contract: overloads come back
+    // as a sorted Ambiguous envelope; an explicit key selects one).
     let resolved = indexer
         .resolve_query(db_path, &ImpactQuery::Name("Add".into()))
-        .expect("fuzzy resolution failed");
-    let canonical = match resolved {
-        KeyMatch::Resolved(k) => k,
-        other => panic!("fuzzy 'Add' should resolve uniquely, got {other:?}"),
-    };
-    let fuzzy_refs = indexer
-        .find_references_for_key(db_path, &canonical)
-        .expect("find_references_for_key failed");
-    assert!(
-        !fuzzy_refs.is_empty(),
-        "Fuzzy lookup for 'Add' should resolve to Calculator.Add"
-    );
-
-    // Ambiguity contract: "Calculator" matches the class AND all four
-    // methods — the adapter must list them, never pick one silently.
-    let resolved = indexer
-        .resolve_query(db_path, &ImpactQuery::Name("Calculator".into()))
         .expect("ambiguous-name resolution failed");
     let candidates = match resolved {
         KeyMatch::Ambiguous(c) => c,
-        other => panic!(
-            "'Calculator' matches several stored symbols and must come back Ambiguous, got {other:?}"
-        ),
+        other => panic!("'Add' has two overloads and must come back Ambiguous, got {other:?}"),
     };
     assert!(
-        candidates.len() >= 4,
-        "Expected >=4 Calculator candidates (class + methods), got {candidates:?}"
+        candidates.len() >= 2,
+        "Expected >=2 Add overload candidates, got {candidates:?}"
+    );
+    assert!(
+        candidates.iter().all(|k| k.contains("Calculator#Add")),
+        "Add candidates must be Calculator.Add overloads, got {candidates:?}"
     );
     assert!(
         candidates.windows(2).all(|w| w[0] <= w[1]),
@@ -423,6 +410,25 @@ fn test_csharp_pipeline_smallsolution_roundtrip() {
         resolved,
         KeyMatch::Resolved(picked.clone()),
         "an explicit candidate selection must resolve to itself"
+    );
+    let fuzzy_refs = indexer
+        .find_references_for_key(db_path, &picked)
+        .expect("find_references_for_key failed");
+    assert!(
+        !fuzzy_refs.is_empty(),
+        "the picked Add overload must have references"
+    );
+
+    // A class name resolves to the class: methods register under their own
+    // simple name (see extract_simple_name), so "Calculator" is NOT
+    // ambiguous even though method keys contain the word.
+    let resolved = indexer
+        .resolve_query(db_path, &ImpactQuery::Name("Calculator".into()))
+        .expect("class-name resolution failed");
+    assert_eq!(
+        resolved,
+        KeyMatch::Resolved("csharp SmallSolution.Library . Calculator#".to_string()),
+        "class name must resolve to the class symbol"
     );
 
     // Position-based lookup: find what's defined on Calculator.cs line 8
