@@ -23,9 +23,21 @@ use std::time::{Duration, Instant};
 
 use super::SymbolReference;
 
+/// References plus the completeness warnings from one resident find-refs
+/// call. The warnings must travel WITH the references, not alongside them
+/// in a log line: a partial answer that gets cached must stay partial
+/// forever after unless the warnings are persisted with it.
+#[derive(Debug, Default)]
+pub(crate) struct ResidentRefs {
+    pub references: Vec<SymbolReference>,
+    /// Non-empty means `references` may be incomplete (a project failed to
+    /// compile, FindReferencesAsync threw). Empty = complete.
+    pub warnings: Vec<String>,
+}
+
 /// Behaviour seam so the pool can be unit-tested without real processes.
 pub(crate) trait ClientLike: Send + Sync {
-    fn find_refs(&self, symbol: &str) -> Result<Vec<SymbolReference>>;
+    fn find_refs(&self, symbol: &str) -> Result<ResidentRefs>;
     /// Kill the helper process. Must be idempotent.
     fn kill(&self);
 }
@@ -165,6 +177,10 @@ struct ServeResponse {
 struct ServeResult {
     #[serde(default)]
     references: Vec<ServeRef>,
+    /// Absent in helper output from before warnings existed — default to
+    /// empty so old binaries keep parsing as "complete".
+    #[serde(default)]
+    warnings: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -181,7 +197,7 @@ fn default_ref_kind() -> String {
 }
 
 impl ClientLike for ServeClient {
-    fn find_refs(&self, symbol: &str) -> Result<Vec<SymbolReference>> {
+    fn find_refs(&self, symbol: &str) -> Result<ResidentRefs> {
         // Sequential protocol: write request, then read exactly one response.
         {
             let mut stdin = self.stdin.lock().expect("serve stdin mutex poisoned");
@@ -206,16 +222,19 @@ impl ClientLike for ServeClient {
         let result = response
             .result
             .context("serve find-refs response has no result")?;
-        Ok(result
-            .references
-            .into_iter()
-            .map(|r| SymbolReference {
-                file: PathBuf::from(r.file),
-                start_line: r.start_line,
-                end_line: r.end_line,
-                kind: r.kind,
-            })
-            .collect())
+        Ok(ResidentRefs {
+            references: result
+                .references
+                .into_iter()
+                .map(|r| SymbolReference {
+                    file: PathBuf::from(r.file),
+                    start_line: r.start_line,
+                    end_line: r.end_line,
+                    kind: r.kind,
+                })
+                .collect(),
+            warnings: result.warnings,
+        })
     }
 
     fn kill(&self) {
@@ -286,12 +305,14 @@ impl WorkspacePool {
     /// `solution`, spawning the helper if the repo has no resident workspace
     /// yet. Errors here are expected and handled by the caller's one-shot
     /// fallback (spawn failure, heap-cap death, eviction race, protocol).
+    /// Completeness warnings travel with the references — the caller
+    /// persists them alongside the cached refs.
     pub(crate) fn find_refs(
         &self,
         helper: &Path,
         solution: &Path,
         symbol: &str,
-    ) -> Result<Vec<SymbolReference>> {
+    ) -> Result<ResidentRefs> {
         // Single-flight per repo: the second concurrent lookup on the same
         // repo waits for the first one's spawn instead of duplicating the
         // minutes-long workspace load.

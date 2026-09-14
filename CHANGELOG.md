@@ -14,7 +14,41 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
-## [1.3.14] - 2026-09-06
+## [1.3.19]
+
+### Changed
+
+- **`find_impact` never silently picks a symbol or an adapter.** An ambiguous name (overloads, multiple definitions on one line) now returns a structured ambiguity envelope with sorted candidates instead of the shortest fuzzy match; an explicit `symbol_key` request field selects an exact candidate (mutually exclusive with `symbol_name` / `file`+`line`), and every resolved answer names its canonical key in the new additive `resolved_symbol` field. With more than one language index installed and no `language` given, the tool asks which one instead of silently using the first (todo #139).
+
+### Added
+
+- **`find_impact` surfaces partial results.** Index warnings — non-compiling C# projects, swallowed reference-resolution exceptions, `scip-typescript` non-zero exits with usable output — now persist (C#: alongside the cached refs in the same transaction; TS: in the index meta) and ride the answer as an additive `warnings` array instead of vanishing into the log, so consumers such as the `audit` binary's `impact`/`removals` never read incomplete evidence as zero (todo #139).
+
+### Fixed
+
+- **Persisted helper-exit warnings are platform-stable — Linux CI green again.** `ExitStatus`'s `Display` renders `exit code: N` on Windows but `exit status: N` on Unix, so the non-zero-exit warning the TypeScript symbol indexer persists into its meta table disagreed with its own regression test on Linux, failing `test-linux`/`csharp-integration-tests` deterministically since #238. A shared `exit_status_text()` renders `exit code: N` on every platform (signal-terminated processes fall back to the platform string), applied to the persisted TS warning and the C#/TS helper log lines, pinned by a cross-platform unit test.
+
+- **C# canonical symbol keys no longer collapse distinct declarations.** Generic arity (``M`1``), the full containing-type chain and fully qualified parameter types are part of the key again, so overloads that previously shared one identity keep their own. The index version is bumped to 2.0 with a key-format stamp in the index meta: a stale-format index reports as absent and rebuilds once on upgrade (todo #139).
+
+## [1.3.16]
+
+### Added
+
+- **REST `/find-impact` endpoint (HTTP mirror of the `find_impact` MCP tool).** The read-only REST surface (`/search`, `/find`, `/explore`, `/chunk/:id`) now also mirrors `find_impact`: POST a `FindImpactRequest` body (`symbol_name`, or `file`+`line`; optional `language`, `project`, `group`) and receive the tool's JSON payload — busy envelope and `index_head_sha`/`current_head_sha` freshness fields included. Same auth class as the other REST mirrors: open on localhost binds, bearer key on network binds. Lets non-MCP clients — notably the `audit` binary — consume SCIP reference evidence without an MCP session.
+
+## [1.3.15]
+
+### Added
+
+- **`edit-guard` — a fourth Claude Code guard hook: edits now require a codesearch consultation first.** On `Edit`/`Write`/`MultiEdit` against a file in a codesearch-registered repo, the hook denies the edit unless codesearch was consulted for that exact path within the last 5 minutes: `find_impact` for SCIP-backed languages (`.cs .ts .tsx .mts .cts`), `find(kind="usages")` for everything else. Markers are recorded by `edit-guard-post`, the first Claude Code `PostToolUse` hook in this repo: it fires on every `find_impact` call and every `find(kind="usages")` (kind check done script-side — matchers only see tool names), counts any outcome ("no results" and "no SCIP backend" included, so the guard can never wedge permanently), and prunes expired entries on write. The guard accepts ANY marker for the path within the window and fails open on unregistered repos, non-git paths and a crashed hook; missing/corrupt state counts as not consulted (deny on covered repos, allow everywhere else). Shared target-resolution/coverage helpers moved into `codesearch-common.sh/.ps1` (grep-guard sources them too; its PowerShell twin is thereby ported off the last `.codesearch.db`/Windows-only-path coverage signals, closing the #199 gap). The native installer writes the new scripts plus a `PostToolUse` registration, idempotent by exact command as before; the subagent preamble gained an EDIT RULE line. Hook self-tests: `bash integrations/claude-code/hooks/run-tests.sh` (todo #134).
+
+## [1.3.14]
+
+### Fixed
+
+- **Concurrent cold opens no longer wedge a repo behind the LMDB double-open guard.** Two overlapping first opens of the same repo (e.g. a `find_impact` racing its own retry) could both reach `try_open_stores`; the loser tripped the double-open guard and cached `Conflicted`, which the self-heal could never cure while the winner held its env — the repo stayed broken until a serve restart (2026-09-08 incident, todo #131). Cold opens are now single-flight per alias in `ServeState`: the loser waits on a per-repo lock and then hits the winner's cache entry. Covers both cold-open entry points (`get_or_open_stores`, `warmup_repo`); the fast path stays lock-free.
+
+## [1.3.13]
 
 ### Fixed
 
