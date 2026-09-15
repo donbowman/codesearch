@@ -1,4 +1,5 @@
 use super::*;
+use serial_test::serial;
 use std::io::Write;
 
 #[test]
@@ -796,8 +797,15 @@ async fn try_open_stores_creates_db_for_brand_new_repo() {
 /// handler's synchronous pre-spawn state — no embedding model required, no
 /// race. `persist_config` honors the temp config override, so the real
 /// `~/.codesearch/repos.json` is never touched.
+///
+/// `#[serial]` + env reset: the handler reads `CODESEARCH_ALLOWED_ROOTS` via
+/// `validate_path_within_allowed_roots`, so this test must not run while the
+/// `allowed_roots_tests` below are mutating it (and must not inherit a stale
+/// value from ambient state).
+#[serial]
 #[tokio::test]
 async fn add_repo_handler_registers_brand_new_repo_without_rollback() {
+    let _env = crate::testing::EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
     let tmp = tempfile::tempdir().unwrap();
     let repo_path = tmp.path().join("brandnew");
     std::fs::create_dir(&repo_path).unwrap();
@@ -984,8 +992,13 @@ fn config_reload_no_spurious_reload() {
 
 /// Verify that the /repos/:alias/reindex route is registered and reachable.
 /// This test starts a real axum server on a random port and sends a POST request.
+///
+/// `#[serial]` + env reset — same allowed-roots race guard as the add_repo
+/// handler test above.
+#[serial]
 #[tokio::test]
 async fn reindex_route_is_registered() {
+    let _env = crate::testing::EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
     let tmp = tempfile::tempdir().unwrap();
     let repo_path = tmp.path().join("myrepo");
     std::fs::create_dir(&repo_path).unwrap();
@@ -1073,8 +1086,10 @@ async fn reindex_route_is_registered() {
 /// corpus index it only holds read-only. The handler returns 409 CONFLICT with
 /// `status: "read_only"` (see the read-only guard in `reindex_handler`,
 /// src/serve/mod.rs).
+#[serial]
 #[tokio::test]
 async fn reindex_refused_for_read_only_repo_even_with_force() {
+    let _env = crate::testing::EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
     let (_tmp, _repo_path, state) = state_with_repo("readonlyrepo");
     // Mark the repo read-only in the live config (how a snapshot-restore sets it).
     state
@@ -1547,20 +1562,17 @@ async fn concurrent_reindex_returns_conflict() {
 
 /// Unit tests for `validate_path_within_allowed_roots`.
 ///
-/// These tests temporarily set/remove the `CODESEARCH_ALLOWED_ROOTS` env var.
-/// A static Mutex serializes env mutation to prevent races under parallel test execution.
+/// These tests mutate the `CODESEARCH_ALLOWED_ROOTS` env var. Per the
+/// AGENTS.md rule they are `#[serial]` and restore the var via `EnvRestore`:
+/// a private Mutex cannot protect against non-serial tests elsewhere in the
+/// process that READ the var through the real handlers (the add_repo
+/// handler test below), which is exactly the 403 flake this closed.
 #[cfg(test)]
 mod allowed_roots_tests {
     use super::*;
+    use crate::testing::EnvRestore;
+    use serial_test::serial;
     use std::path::PathBuf;
-    use std::sync::Mutex;
-
-    /// Global lock to serialize env var mutations across parallel test threads.
-    static ENV_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
-
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
 
     /// Helper: create a unique temp dir per test, return its canonical path.
     fn temp_root(suffix: &str) -> PathBuf {
@@ -1569,57 +1581,49 @@ mod allowed_roots_tests {
         safe_canonicalize(&dir).unwrap()
     }
 
-    fn clear_env() {
-        std::env::remove_var(ALLOWED_ROOTS_ENV);
-    }
-
-    fn set_env(val: &str) {
-        std::env::set_var(ALLOWED_ROOTS_ENV, val);
-    }
-
+    #[serial]
     #[test]
     fn env_unset_allows_all() {
-        let _guard = lock();
-        clear_env();
+        let _env = EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
         let path = PathBuf::from("/some/random/path");
         assert!(validate_path_within_allowed_roots(&path).is_ok());
     }
 
+    #[serial]
     #[test]
     fn env_empty_allows_all() {
-        let _guard = lock();
-        set_env("");
+        let _env = EnvRestore::set(&[(ALLOWED_ROOTS_ENV, "")]);
         let path = PathBuf::from("/some/random/path");
         assert!(validate_path_within_allowed_roots(&path).is_ok());
-        clear_env();
     }
 
+    #[serial]
     #[test]
     fn path_within_root_is_allowed() {
-        let _guard = lock();
+        let _env = EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
         let root = temp_root("within");
-        set_env(&root.display().to_string());
+        std::env::set_var(ALLOWED_ROOTS_ENV, root.display().to_string());
         let child = root.join("my-project");
         let _ = std::fs::create_dir_all(&child);
         let canonical_child = safe_canonicalize(&child).unwrap();
         assert!(validate_path_within_allowed_roots(&canonical_child).is_ok());
-        clear_env();
     }
 
+    #[serial]
     #[test]
     fn exact_root_match_is_allowed() {
-        let _guard = lock();
+        let _env = EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
         let root = temp_root("exact");
-        set_env(&root.display().to_string());
+        std::env::set_var(ALLOWED_ROOTS_ENV, root.display().to_string());
         assert!(validate_path_within_allowed_roots(&root).is_ok());
-        clear_env();
     }
 
+    #[serial]
     #[test]
     fn path_outside_root_is_rejected() {
-        let _guard = lock();
+        let _env = EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
         let root = temp_root("outside");
-        set_env(&root.display().to_string());
+        std::env::set_var(ALLOWED_ROOTS_ENV, root.display().to_string());
         // Construct a path guaranteed outside the temp root
         let outside = if cfg!(windows) {
             PathBuf::from("C:\\Windows\\System32")
@@ -1635,40 +1639,45 @@ mod allowed_roots_tests {
         let result = validate_path_within_allowed_roots(&outside);
         assert!(result.is_err(), "Expected rejection for path outside root");
         assert!(result.unwrap_err().contains("outside allowed roots"));
-        clear_env();
     }
 
+    #[serial]
     #[test]
     fn all_nonexistent_roots_rejects() {
-        let _guard = lock();
-        set_env("/nonexistent/path/abc;/also/nonexistent/xyz");
+        let _env = EnvRestore::set(&[(
+            ALLOWED_ROOTS_ENV,
+            "/nonexistent/path/abc;/also/nonexistent/xyz",
+        )]);
         let some_path = std::env::temp_dir();
         let canonical = safe_canonicalize(&some_path).unwrap();
         let result = validate_path_within_allowed_roots(&canonical);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No valid roots found"));
-        clear_env();
     }
 
+    #[serial]
     #[test]
     fn semicolons_with_empty_segments_works() {
-        let _guard = lock();
+        let _env = EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
         let root = temp_root("semicolons");
-        set_env(&format!(";{};;", root.display()));
+        std::env::set_var(ALLOWED_ROOTS_ENV, format!(";{};;", root.display()));
         let child = root.join("project");
         let _ = std::fs::create_dir_all(&child);
         let canonical_child = safe_canonicalize(&child).unwrap();
         assert!(validate_path_within_allowed_roots(&canonical_child).is_ok());
-        clear_env();
     }
 
+    #[serial]
     #[test]
     fn multiple_roots_any_match() {
-        let _guard = lock();
+        let _env = EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
         let root1 = temp_root("multi1");
         let root2 = temp_root("multi2");
 
-        set_env(&format!("{};{}", root1.display(), root2.display()));
+        std::env::set_var(
+            ALLOWED_ROOTS_ENV,
+            format!("{};{}", root1.display(), root2.display()),
+        );
 
         // Path under root1
         let child1 = root1.join("project");
@@ -1681,8 +1690,6 @@ mod allowed_roots_tests {
         let _ = std::fs::create_dir_all(&child2);
         let canonical2 = safe_canonicalize(&child2).unwrap();
         assert!(validate_path_within_allowed_roots(&canonical2).is_ok());
-
-        clear_env();
     }
 }
 
