@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use fastembed::{EmbeddingModel as FastEmbedModel, InitOptions, TextEmbedding};
-use ort::execution_providers::CPUExecutionProvider;
+use ort::ep::CPU;
 
 use crate::file::Language;
 
@@ -312,9 +312,7 @@ impl FastEmbedder {
 
         // Use CPU execution provider WITH arena allocator for speed.
         // Arena allocator provides fast memory reuse during inference.
-        let cpu_ep = CPUExecutionProvider::default()
-            .with_arena_allocator(true)
-            .build();
+        let cpu_ep = CPU::default().with_arena_allocator(true).build();
 
         let model = TextEmbedding::try_new(
             InitOptions::new(model_type.to_fastembed_model())
