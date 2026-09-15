@@ -20,6 +20,10 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **Dependency refresh: h2, rustls, quinn-proto, zerovec-derive, moka.** A semver-safe `cargo update` lifts 126 packages within their existing requirements, clearing five open advisories without code changes: h2 0.4.15→0.4.19 (Aikido 41883526), rustls 0.23.42→0.23.45 (RUSTSEC-2026-0285), quinn-proto 0.11.16→0.11.18 (Aikido 41883527), zerovec-derive 0.11.3→0.11.6 (Aikido 41883531) and moka 0.12.15→0.12.16 (Aikido 41297220). fastembed/ort are deliberately kept at 5.17.3/rc.12 — 5.17.4 hard-requires the unstable ort rc.13 API break, which moves in its own PR.
 
+### Changed
+
+- **Vector-index stack aligned on rand 0.10: arroy 0.5→0.8, heed 0.20→0.22.** The direct `rand` requirement moves to 0.10.2 — the major rmcp already uses — instead of pinning three rand majors side by side in the lock. arroy 0.8 and heed 0.22 follow because arroy 0.8 hard-requires both (`rand ^0.10.2`, `heed ^0.22.1`); no call-site changes were needed beyond silencing heed's `EnvFlags::NO_TLS` deprecation (same LMDB `MDB_NOTLS` flag, same behavior — the type-state `Env<WithoutTls>` migration is deferred). heed-types 0.21, roaring 0.11 and ordered-float 5 ride along transitively. Note: the rand 0.9.5 Aikido flagged rides the fastembed→hf-hub/tokenizers chain and clears with the fastembed 6 major, not with this change.
+
 ## [1.3.19]
 
 ### Changed
