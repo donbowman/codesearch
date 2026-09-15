@@ -770,7 +770,7 @@ async fn try_open_stores_creates_db_for_brand_new_repo() {
 
     let state = state_with_config(ReposConfig::default());
 
-    match state.try_open_stores("brandnew", &db_path, true, false) {
+    match state.try_open_stores("brandnew", &db_path, true, false, None) {
         Ok(OpenedStores::Write(_)) => {}
         Ok(OpenedStores::Readonly(_)) => {
             panic!("brand-new repo opened Readonly; expected Write")
@@ -2306,7 +2306,7 @@ async fn index_rm_deletes_db_while_serve_holds_real_lmdb_env() {
 
     // Serve opens the repo FOR REAL — a live LMDB env under db_path.
     let opened = state
-        .try_open_stores("heldenv", &db_path, true, false)
+        .try_open_stores("heldenv", &db_path, true, false, None)
         .expect("opening a real store for a brand-new repo must succeed");
     let OpenedStores::Write(stores) = opened else {
         panic!("brand-new repo must open Write, not Readonly");
@@ -2555,5 +2555,39 @@ fn group_status_model_label_is_common_or_mixed() {
         svc.group_model_label(&["rebuilt".to_string()]),
         "embeddinggemma-q4",
         "a single-model group must name its base model"
+    );
+}
+
+/// A fresh repo added with a model override must open its store at that model's
+/// dimension, not the 384-dim default. Regression guard for `POST /repos` with
+/// `model=embeddinggemma-q4`: the store used to be created at 384 and the
+/// override applied only to metadata, so the reindex embedded 768-dim vectors
+/// into a 384-dim store and indexed nothing.
+#[tokio::test]
+async fn try_open_stores_honours_dimension_override_for_a_fresh_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("gemmarepo");
+    std::fs::create_dir(&repo_path).unwrap();
+    let db_path = repo_path.join(DB_DIR_NAME);
+    assert!(!db_path.exists(), "precondition: db dir must not exist yet");
+
+    let state = state_with_config(ReposConfig::default());
+
+    let stores = match state.try_open_stores("gemmarepo", &db_path, true, false, Some(768)) {
+        Ok(OpenedStores::Write(s)) => s,
+        Ok(OpenedStores::Readonly(_)) => panic!("expected Write, got Readonly"),
+        Err(e) => panic!("fresh open with a dimension override must succeed, got: {e}"),
+    };
+
+    let dims = stores
+        .vector_store
+        .read()
+        .await
+        .stats()
+        .expect("stats on a freshly created store")
+        .dimensions;
+    assert_eq!(
+        dims, 768,
+        "a repo added with --model embeddinggemma-q4 must open at 768 dims, not the 384 default"
     );
 }

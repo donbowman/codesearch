@@ -2015,7 +2015,7 @@ impl ServeState {
         let db_path = path.join(DB_DIR_NAME);
 
         // Open stores: existence check + write/readonly/conflicted logic.
-        let stores = match self.try_open_stores(alias, &db_path, false, force_readonly)? {
+        let stores = match self.try_open_stores(alias, &db_path, false, force_readonly, None)? {
             OpenedStores::Readonly(stores) => {
                 // Already registered as Readonly by try_open_stores.
                 //
@@ -2217,7 +2217,7 @@ impl ServeState {
         let db_path = path.join(DB_DIR_NAME);
 
         // Open stores: existence check + write/readonly/conflicted logic.
-        let stores = match self.try_open_stores(alias, &db_path, false, force_readonly)? {
+        let stores = match self.try_open_stores(alias, &db_path, false, force_readonly, None)? {
             OpenedStores::Readonly(s) => {
                 // Already registered as Readonly; touch and return.
                 self.touch_access(alias);
@@ -2463,12 +2463,20 @@ impl ServeState {
     ///
     /// `allow_create=false`: warmup / incremental reindex path — fails if DB is missing.
     /// `allow_create=true`:  force-reindex / add-repo path — creates fresh DB if missing.
+    ///
+    /// `dimension_override` forces the embeddings dimension (e.g. a model
+    /// override on `POST /repos`); `None` reads it from `metadata.json`. The
+    /// caller must have made the on-disk store consistent with the override
+    /// (a fresh DB, or one whose data will be cleared by the reindex) — opening
+    /// a store at a different dimension than its vectors were written with
+    /// yields a dimension mismatch on the first insert.
     fn try_open_stores(
         &self,
         alias: &str,
         db_path: &Path,
         allow_create: bool,
         force_readonly: bool,
+        dimension_override: Option<usize>,
     ) -> std::result::Result<OpenedStores, String> {
         if !db_path.exists() && !allow_create {
             let parent = db_path
@@ -2484,7 +2492,7 @@ impl ServeState {
             ));
         }
 
-        let dims = self.get_dimensions_for_path(db_path);
+        let dims = dimension_override.unwrap_or_else(|| self.get_dimensions_for_path(db_path));
 
         // Read-only requested via the per-repo `repo_read_only` config flag:
         // open readonly directly and never attempt a write open. This makes
@@ -3777,7 +3785,7 @@ async fn reindex_handler(
                 // FSW not running -- open existing or create fresh DB.
                 // allow_create=true so a force-reindex can recover a deleted DB.
                 let cancel = CancellationToken::new();
-                match state.try_open_stores(&alias, &db_path, true, false) {
+                match state.try_open_stores(&alias, &db_path, true, false, None) {
                     Ok(OpenedStores::Write(s)) => {
                         // Register as Write to block double-open races while we reindex.
                         state.repos.insert(
@@ -4030,6 +4038,27 @@ async fn add_repo_handler(
         );
     }
 
+    // Parse the optional model override BEFORE opening the store: a fresh index
+    // must be created at the override's dimension, not the 384-dim default.
+    // Previously the store was opened at the default (or the previous metadata's)
+    // dimension and the override was only applied to metadata afterwards, so the
+    // reindex embedded 768-dim vectors into a 384-dim store and indexed nothing.
+    let model_override: Option<crate::embed::ModelType> = match body.model.as_deref() {
+        Some(model_str) => match crate::embed::ModelType::parse(model_str) {
+            Some(mt) => Some(mt),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::response::Json(json!({
+                        "error": format!("Unknown model: '{}'. Use one of: {}", model_str, crate::embed::ModelType::valid_short_names()),
+                        "status": "error"
+                    })),
+                );
+            }
+        },
+        None => None,
+    };
+
     // Register in repos.json
     let alias = {
         let mut config = match state.config.write() {
@@ -4088,7 +4117,13 @@ async fn add_repo_handler(
     //  path opened its own LMDB handle, conflicting with
     //  calls from the serve's request handlers.
     let db_path = canonical_path.join(DB_DIR_NAME);
-    let stores = match state.try_open_stores(&alias, &db_path, true, false) {
+    let stores = match state.try_open_stores(
+        &alias,
+        &db_path,
+        true,
+        false,
+        model_override.map(|m| m.dimensions()),
+    ) {
         Ok(OpenedStores::Write(s)) => s,
         Ok(OpenedStores::Readonly(_)) => {
             unreachable!(
@@ -4158,23 +4193,6 @@ async fn add_repo_handler(
             })),
         );
     }
-
-    // Parse optional model override from request body.
-    let model_override: Option<crate::embed::ModelType> = match body.model.as_deref() {
-        Some(model_str) => match crate::embed::ModelType::parse(model_str) {
-            Some(mt) => Some(mt),
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    axum::response::Json(json!({
-                        "error": format!("Unknown model: '{}'. Use one of: {}", model_str, crate::embed::ModelType::valid_short_names()),
-                        "status": "error"
-                    })),
-                );
-            }
-        },
-        None => None,
-    };
 
     // Spawn the heavy indexing work in the background.  Returns 202 immediately.
     let alias_bg = alias.clone();
