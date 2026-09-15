@@ -30,6 +30,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **Embedding stack majors: fastembed 6.1, hf-hub 1.0, ndarray 0.17.** Zero call-site changes — the codesearch embedder sits on fastembed's `ModelType`/`InitOptions` surface, which 6.1 kept stable. Scope note: fastembed 6.1 still resolves `image 0.25`, so the weezl 0.1.12/moxcms 0.8.1 advisories (Aikido 30640676/37515815) remain open until fastembed adopts image 0.26+; likewise rand 0.9.5 stays via hf-hub 0.5/tokenizers.
 
+- **tantivy 0.22 → 0.26 with graceful FTS reset.** The collector API changed so `TopDocs::with_limit` needs `.order_by_score()` at the three call sites. Because tantivy cannot open index files written by an older major, an unreadable FTS index is now wiped and recreated as a fresh empty index instead of failing the whole DB open — the FTS index is derived data, BM25 results rebuild on the next (re)index, and a warning is logged pointing at `codesearch index`. Vector search and all non-FTS paths are unaffected; pinned by a regression test that feeds the store a corrupt `meta.json`.
+
 ## [1.3.19]
 
 ### Changed
