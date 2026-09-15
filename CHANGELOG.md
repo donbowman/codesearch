@@ -42,6 +42,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **tree-sitter 0.26 → 0.27, tree-sitter-proto 0.4 → 0.6.** Zero call-site changes — the chunker sits on the stable `Parser`/`Language` surface and grammars load through the ABI-stable `LANGUAGE.into()` (`tree-sitter-language`) route, so all 17 grammar crates stay pinned while the core moves a major.
 
+- **Small majors batch: dirs 7, sha2 0.11, scip 0.10, sysinfo 0.39; dead `tower`/`tower-http` direct deps removed.** dirs/scip/sysinfo were drop-in. sha2 0.11's digest arrays no longer implement `LowerHex`, so the two hash-to-hex sites (`file_meta.rs`, `chunker/mod.rs`) hex-encode the digest bytes explicitly — output unchanged. `tower` and `tower-http` were declared as direct dependencies but never imported anywhere (CORS/trace middleware never wired in); removing them shrinks the direct dependency surface (both remain in the lock transitively via axum/reqwest/hf-hub, which is upstream's business).
+
 ## [1.3.19]
 
 ### Changed
