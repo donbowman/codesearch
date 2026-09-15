@@ -22,6 +22,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 ### Changed
 
+- **ort rc.13 + fastembed 5.17.4 (ONNX runtime refresh).** fastembed 5.17.4 hard-requires ort 2.0.0-rc.13, so both move together. rc.13 renamed the CPU execution provider (`CPUExecutionProvider` → `ort::ep::CPU`); the embedder's import and construction follow, builder chain unchanged (arena allocator still on). Scope note: ort-sys rc.13 still pins `lzma-rust2 ^0.15`, so the lzma-rust2 0.16.5 advisory (Aikido 37515813) remains open until upstream bumps its build dependency.
+
 - **Vector-index stack aligned on rand 0.10: arroy 0.5→0.8, heed 0.20→0.22.** The direct `rand` requirement moves to 0.10.2 — the major rmcp already uses — instead of pinning three rand majors side by side in the lock. arroy 0.8 and heed 0.22 follow because arroy 0.8 hard-requires both (`rand ^0.10.2`, `heed ^0.22.1`); no call-site changes were needed beyond silencing heed's `EnvFlags::NO_TLS` deprecation (same LMDB `MDB_NOTLS` flag, same behavior — the type-state `Env<WithoutTls>` migration is deferred). heed-types 0.21, roaring 0.11 and ordered-float 5 ride along transitively. Note: the rand 0.9.5 Aikido flagged rides the fastembed→hf-hub/tokenizers chain and clears with the fastembed 6 major, not with this change.
 
 ## [1.3.19]
