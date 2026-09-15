@@ -28,10 +28,10 @@ anyhow = "1.0"
 thiserror = "1.0"
 
 # ML & Embeddings
-fastembed = "5.0"
+fastembed = "6.1"
 ort = { version = "2.0.0-rc.10", features = ["download-binaries", "copy-dylibs"] }
-ndarray = "0.16"
-hf-hub = "0.3"
+ndarray = "0.17"
+hf-hub = "1.0"
 
 # Vector DB (temporarily commented due to dep conflicts)
 # lancedb = "0.5"
