@@ -32,6 +32,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **tantivy 0.22 → 0.26 with graceful FTS reset.** The collector API changed so `TopDocs::with_limit` needs `.order_by_score()` at the three call sites. Because tantivy cannot open index files written by an older major, an unreadable FTS index is now wiped and recreated as a fresh empty index instead of failing the whole DB open — the FTS index is derived data, BM25 results rebuild on the next (re)index, and a warning is logged pointing at `codesearch index`. Vector search and all non-FTS paths are unaffected; pinned by a regression test that feeds the store a corrupt `meta.json`.
 
+- **TUI stack majors: ratatui 0.30, crossterm 0.29.** Zero call-site changes — the serve TUI sits on stable surface (`CrosstermBackend`, `Terminal`, `TableState`, `Paragraph`, `Layout`). This removes the last lru 0.12.5 path (ratatui's chain now carries lru 0.18.4; tantivy stays on the 0.16.4 that upstream 0.26 pins).
+
 ## [1.3.19]
 
 ### Changed
