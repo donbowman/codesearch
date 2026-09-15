@@ -990,7 +990,7 @@ fn config_reload_no_spurious_reload() {
     assert_eq!(after_second, after_first);
 }
 
-/// Verify that the /repos/:alias/reindex route is registered and reachable.
+/// Verify that the /repos/{alias}/reindex route is registered and reachable.
 /// This test starts a real axum server on a random port and sends a POST request.
 ///
 /// `#[serial]` + env reset — same allowed-roots race guard as the add_repo
@@ -1019,7 +1019,7 @@ async fn reindex_route_is_registered() {
             axum::routing::get(health_handler),
         )
         .route(
-            "/repos/:alias/reindex",
+            "/repos/{alias}/reindex",
             axum::routing::post(reindex_handler),
         )
         .with_state(state);
@@ -1106,7 +1106,7 @@ async fn reindex_refused_for_read_only_repo_even_with_force() {
             axum::routing::get(health_handler),
         )
         .route(
-            "/repos/:alias/reindex",
+            "/repos/{alias}/reindex",
             axum::routing::post(reindex_handler),
         )
         .with_state(state);
@@ -1196,7 +1196,7 @@ async fn healthz_is_unauthenticated_on_network_bind() {
     );
 }
 
-/// Verify that the /repos/:alias/info and /repos/:alias/doctor routes are
+/// Verify that the /repos/{alias}/info and /repos/{alias}/doctor routes are
 /// registered and reachable. Starts a real axum server on a random port and
 /// asserts that an unknown alias yields our handler's 404 (not axum's 404).
 #[tokio::test]
@@ -1220,8 +1220,8 @@ async fn info_doctor_routes_registered() {
             crate::constants::HEALTH_PATH,
             axum::routing::get(health_handler),
         )
-        .route("/repos/:alias/info", axum::routing::get(info_handler))
-        .route("/repos/:alias/doctor", axum::routing::post(doctor_handler))
+        .route("/repos/{alias}/info", axum::routing::get(info_handler))
+        .route("/repos/{alias}/doctor", axum::routing::post(doctor_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1309,7 +1309,7 @@ async fn info_doctor_routes_registered() {
 }
 
 /// Verify that the federation REST endpoints (/search, /find, /explore,
-/// /chunk/:id) are registered and reachable. Each must dispatch to OUR
+/// /chunk/{id}) are registered and reachable. Each must dispatch to OUR
 /// handler (returning a JSON body) rather than axum's built-in empty 404.
 /// Starts a real axum server on a random port.
 #[tokio::test]
@@ -1512,7 +1512,7 @@ async fn concurrent_reindex_returns_conflict() {
 
     let app = axum::Router::new()
         .route(
-            "/repos/:alias/reindex",
+            "/repos/{alias}/reindex",
             axum::routing::post(reindex_handler),
         )
         .with_state(state);
@@ -2137,7 +2137,7 @@ async fn indexing_route_answers_json() {
 /// Shared envelope for the Layer-2 e2e tests below: pin the delegation env
 /// vars to a fresh temp repos.json, seed it via `seed`, spawn a REAL serve
 /// (the two routes the CLI `index rm` delegation touches: `GET /health` and
-/// the real `remove_repo_handler` at `DELETE /repos/:alias`) sharing that
+/// the real `remove_repo_handler` at `DELETE /repos/{alias}`) sharing that
 /// config, and wait (bounded, panicking on timeout) for it to accept.
 ///
 /// Every step here is trap-sensitive, which is why it is a helper and not
@@ -2188,7 +2188,7 @@ where
             crate::constants::HEALTH_PATH,
             axum::routing::get(health_handler),
         )
-        .route("/repos/:alias", axum::routing::delete(remove_repo_handler))
+        .route("/repos/{alias}", axum::routing::delete(remove_repo_handler))
         .with_state(state.clone());
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -2212,7 +2212,7 @@ where
 
 /// The full Layer-2 acceptance path: a running serve instance holds the
 /// repo's registration; `remove_from_index` (the CLI code path) must
-/// DELEGATE to it (health probe → DELETE /repos/:alias), serve must stop
+/// DELEGATE to it (health probe → DELETE /repos/{alias}), serve must stop
 /// holders and delete the DB directory WITHOUT being stopped, repos.json
 /// must lose the entry, and a later query for the alias must be a clean
 /// "Unknown alias" (no zombie stores) — all without stopping serve.

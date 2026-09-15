@@ -34,6 +34,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **TUI stack majors: ratatui 0.30, crossterm 0.29.** Zero call-site changes — the serve TUI sits on stable surface (`CrosstermBackend`, `Terminal`, `TableState`, `Paragraph`, `Layout`). This removes the last lru 0.12.5 path (ratatui's chain now carries lru 0.18.4; tantivy stays on the 0.16.4 that upstream 0.26 pins).
 
+- **axum 0.7 → 0.8.** The only breaking surface hit: path parameters changed syntax from `:param` to `{param}` — all route registrations (`/repos/:alias*`, `/chunk/:id`) and the shared `CHUNK_PATH` constant move to brace syntax, including the federation client's URL templating that derives from the same constant. Extractors, middleware and `axum::serve` compile unchanged; the serve + federation test suites exercise the rebuilt router end-to-end.
+
 ## [1.3.19]
 
 ### Changed
