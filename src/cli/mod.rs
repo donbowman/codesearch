@@ -261,7 +261,9 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub store: Option<String>,
 
-    /// Embedding model to use (e.g., bge-small, jina-code, embeddinggemma-q4)
+    /// Embedding model to use (e.g., bge-small, jina-code, embeddinggemma-q4).
+    /// On `serve`, this is the default for newly created indexes; each repo's
+    /// existing index keeps the model recorded in its own metadata.
     #[arg(long, global = true)]
     pub model: Option<String>,
 }
@@ -1222,21 +1224,19 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     if let Err(e) = crate::logger::init_serve_logger(log_level, effective_quiet) {
                         eprintln!("Warning: failed to initialize serve logger: {}", e);
                     }
-                    // `--model` is a global flag inherited by every subcommand, but
-                    // serve resolves each repo's model from its own index metadata
-                    // (a hub can hold indexes built with different models). Say so
-                    // rather than silently ignoring the flag.
-                    if model_type.is_some() {
-                        eprintln!(
-                            "Warning: `--model` does not apply to `serve` — each repo's embedding \
-                             model is read from its own index metadata. To change a repo's model, \
-                             re-index it: `codesearch --model <name> index <path> --force`."
-                        );
+                    // `--model` is a global flag inherited by every subcommand. On
+                    // `serve` it sets the serve-wide default for newly created
+                    // indexes — each repo's queries still use the model recorded
+                    // in its own index metadata (a hub may mix models), so this
+                    // never overrides an existing index.
+                    if let Some(mt) = model_type {
+                        warn_if_heavier_model(mt);
                     }
                     crate::serve::run_serve(
                         host,
                         port,
                         register,
+                        model_type,
                         no_tui,
                         keep_warm_url,
                         idle_suspend_secs,

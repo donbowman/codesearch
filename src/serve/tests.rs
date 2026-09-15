@@ -851,6 +851,168 @@ async fn add_repo_handler_registers_brand_new_repo_without_rollback() {
     );
 }
 
+/// `POST /repos` with no explicit `model` must create a brand-new index at the
+/// serve-wide default's dimension (`codesearch serve --model X`), not the
+/// built-in 384-dim default. This is the write-side counterpart of the per-repo
+/// query-model contract.
+#[tokio::test]
+async fn add_repo_handler_uses_serve_default_model_for_new_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("defaulted");
+    std::fs::create_dir(&repo_path).unwrap();
+
+    let state = Arc::new(
+        state_with_config(ReposConfig::default())
+            .with_default_model(Some(crate::embed::ModelType::EmbeddingGemma300MQ4)),
+    );
+
+    let (status, body) = add_repo_handler(
+        axum::extract::State(state.clone()),
+        axum::extract::Json(AddRepoRequest {
+            path: repo_path.clone(),
+            alias: Some("defaulted".to_string()),
+            model: None,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::ACCEPTED,
+        "add must be accepted, got {}: {}",
+        status,
+        body.0
+    );
+
+    let stores = state
+        .get_opened_stores("defaulted")
+        .expect("store must be open immediately after add");
+    let dims = stores
+        .vector_store
+        .try_read()
+        .unwrap()
+        .stats()
+        .unwrap()
+        .dimensions;
+    assert_eq!(
+        dims,
+        crate::embed::ModelType::EmbeddingGemma300MQ4.dimensions(),
+        "a new index must be created at the serve default model's dimension"
+    );
+}
+
+/// The serve-wide default must NOT override an index that already records its
+/// own model: re-adding a repo whose `.codesearch.db` is still on disk keeps the
+/// recorded model and dimension.
+#[tokio::test]
+async fn add_repo_handler_keeps_recorded_model_over_serve_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("existing");
+    std::fs::create_dir(&repo_path).unwrap();
+    let db_path = repo_path.join(DB_DIR_NAME);
+
+    // A pre-existing index recording the 384-dim default model.
+    std::fs::create_dir_all(&db_path).unwrap();
+    let mut meta = serde_json::Map::new();
+    crate::embed::ModelType::AllMiniLML6V2Q.write_metadata_fields(&mut meta);
+    std::fs::write(
+        db_path.join("metadata.json"),
+        serde_json::to_string(&meta).unwrap(),
+    )
+    .unwrap();
+
+    let state = Arc::new(
+        state_with_config(ReposConfig::default())
+            .with_default_model(Some(crate::embed::ModelType::EmbeddingGemma300MQ4)),
+    );
+
+    let (status, body) = add_repo_handler(
+        axum::extract::State(state.clone()),
+        axum::extract::Json(AddRepoRequest {
+            path: repo_path.clone(),
+            alias: Some("existing".to_string()),
+            model: None,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::ACCEPTED,
+        "add must be accepted, got {}: {}",
+        status,
+        body.0
+    );
+
+    let stores = state
+        .get_opened_stores("existing")
+        .expect("store must be open immediately after add");
+    let dims = stores
+        .vector_store
+        .try_read()
+        .unwrap()
+        .stats()
+        .unwrap()
+        .dimensions;
+    assert_eq!(
+        dims,
+        crate::embed::ModelType::AllMiniLML6V2Q.dimensions(),
+        "an existing index must keep its recorded model, not adopt the serve default"
+    );
+}
+
+/// Precedence contract for the model a `POST /repos` add indexes with.
+#[test]
+fn resolve_add_repo_model_precedence() {
+    use crate::embed::ModelType;
+    let gemma = ModelType::EmbeddingGemma300MQ4;
+    let mini = ModelType::AllMiniLML6V2Q;
+
+    // Explicit model always wins, even over a recorded model and a default.
+    assert_eq!(
+        resolve_add_repo_model(Some(gemma), Some(mini), Some(mini)),
+        Some(gemma)
+    );
+    // No explicit model, no recorded model → serve default applies (new index).
+    assert_eq!(resolve_add_repo_model(None, None, Some(gemma)), Some(gemma));
+    // No explicit model, recorded model present → serve default is ignored.
+    assert_eq!(resolve_add_repo_model(None, Some(mini), Some(gemma)), None);
+    // No explicit model, no recorded model, no default → no override.
+    assert_eq!(resolve_add_repo_model(None, None, None), None);
+    // Explicit model still wins when nothing else is set.
+    assert_eq!(resolve_add_repo_model(Some(mini), None, None), Some(mini));
+}
+
+/// The serve-wide default is the fallback query model in serve mode, so a repo
+/// whose `metadata.json` records no model is queried with it rather than the
+/// built-in default.
+#[test]
+fn serve_default_model_is_service_fallback() {
+    use crate::embed::ModelType;
+    let state = std::sync::Arc::new(
+        ServeState::new(ReposConfig::default(), None)
+            .with_default_model(Some(ModelType::EmbeddingGemma300MQ4)),
+    );
+    assert_eq!(state.default_model(), Some(ModelType::EmbeddingGemma300MQ4));
+
+    let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+    assert_eq!(
+        svc.query_model(None),
+        ModelType::EmbeddingGemma300MQ4,
+        "serve must fall back to its default model, not the built-in default"
+    );
+}
+
+/// Without `--model`, `ServeState` reports no default and the service falls back
+/// to the built-in default.
+#[test]
+fn no_serve_default_keeps_builtin_fallback() {
+    use crate::embed::ModelType;
+    let state = std::sync::Arc::new(ServeState::new(ReposConfig::default(), None));
+    assert_eq!(state.default_model(), None);
+
+    let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+    assert_eq!(svc.query_model(None), ModelType::default());
+}
+
 /// `persist_config` must write to the override path (and therefore be
 /// observable by `reload_if_changed`/`config_snapshot`) rather than the real
 /// `~/.codesearch/repos.json`. Guards the wiring that makes the register

@@ -902,12 +902,17 @@ impl CodesearchService {
     /// it routes requests to the repo identified by `project`/`group`.
     pub(crate) fn new_for_serve(serve_state: Arc<crate::serve::ServeState>) -> Result<Self> {
         let symbol_registry = serve_state.symbol_registry();
+        // Fall back to the serve-wide default model (`serve --model`) rather
+        // than the built-in default: the same value `POST /repos` stamps into
+        // a newly created index, so the unpinned status summary and any repo
+        // whose `metadata.json` records no model report/query with it.
+        let model_type = serve_state.default_model().unwrap_or_default();
         Ok(Self {
             tool_router: Self::merged_tool_router(),
             db_path: PathBuf::from("serve://multi-repo"),
             project_path: PathBuf::from("serve://multi-repo"),
-            model_type: ModelType::default(),
-            dimensions: crate::constants::DEFAULT_EMBEDDING_DIMENSIONS,
+            model_type,
+            dimensions: model_type.dimensions(),
             embedding_pool: serve_state.embedding_pool(),
             shared_stores: None,
             serve_state: Some(serve_state),

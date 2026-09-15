@@ -135,8 +135,12 @@ to the required `--force` rebuild instead of mixing incompatible vector spaces.
 In **serve** mode the model is resolved **per repository**, from each index's own
 metadata, not from a hub-wide setting: a hub may hold indexes built with
 different models, and every query is embedded with the model of the repo it
-targets (mixed-model groups are fine). Consequently `--model` has no effect on
-`codesearch serve` — to change a repo's model, re-index that repo
+targets (mixed-model groups are fine). `codesearch serve --model <name>` sets a
+**default for newly created indexes**: a repo added without an explicit model
+(e.g. `codesearch index add` with no `--model`, delegated to serve) is indexed
+with it, and it is reported in `GET /status` as `default_model`. It never
+overrides an index that already records its own model — to change an existing
+repo's model, re-index that repo
 (`codesearch --model <name> index <path> --force`) and restart serve.
 
 ## MCP Configuration

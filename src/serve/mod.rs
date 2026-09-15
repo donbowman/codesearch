@@ -280,6 +280,14 @@ pub(crate) struct ServeState {
     /// with the model of the repo it targets. Mirrors the `symbol_registry`
     /// pattern.
     embedding_pool: Arc<crate::embed::EmbeddingServicePool>,
+    /// Serve-wide default embedding model for newly created indexes
+    /// (`codesearch serve --model <name>`), or `None` for the built-in default.
+    ///
+    /// This never overrides an index that already records its own model: it
+    /// applies only when `POST /repos` creates a brand-new index without an
+    /// explicit `model`, and as the fallback query model for a repo whose
+    /// `metadata.json` has no recorded model.
+    default_model: Option<crate::embed::ModelType>,
     /// Per-repo total tool call count.
     tool_call_counts: DashMap<String, AtomicU64>,
     /// Per-repo C# symbol index status (cached, updated on rebuild/detect).
@@ -362,6 +370,7 @@ impl ServeState {
             embedding_pool: Arc::new(crate::embed::EmbeddingServicePool::new(
                 crate::constants::get_global_models_cache_dir().ok(),
             )),
+            default_model: None,
             tool_call_counts: DashMap::new(),
             csharp_index_status: Arc::new(DashMap::new()),
             csharp_index_error: Arc::new(DashMap::new()),
@@ -460,6 +469,21 @@ impl ServeState {
     /// reloaded per request/session.
     pub(crate) fn embedding_pool(&self) -> Arc<crate::embed::EmbeddingServicePool> {
         Arc::clone(&self.embedding_pool)
+    }
+
+    /// Attach the serve-wide default embedding model (`codesearch serve --model`).
+    ///
+    /// Set once at startup, before the state is shared. `None` leaves the
+    /// built-in default in place.
+    pub(crate) fn with_default_model(mut self, model: Option<crate::embed::ModelType>) -> Self {
+        self.default_model = model;
+        self
+    }
+
+    /// The serve-wide default embedding model for newly created indexes, or
+    /// `None` for the built-in default. See [`Self::with_default_model`].
+    pub(crate) fn default_model(&self) -> Option<crate::embed::ModelType> {
+        self.default_model
     }
 
     /// Resolve the embedding model an alias's index was built with.
@@ -3265,6 +3289,10 @@ async fn status_handler(
 
     let uptime_secs = state.started_at().elapsed().as_secs();
 
+    // Serve-wide default model for newly created indexes (`serve --model`).
+    // `null` means the built-in default.
+    let default_model = state.default_model().map(|m| m.short_name());
+
     // CPU usage — reuse shared System instance so cpu_usage() can compute delta
     let cpu = {
         use sysinfo::ProcessesToUpdate;
@@ -3275,6 +3303,7 @@ async fn status_handler(
                     "version": env!("CARGO_PKG_VERSION"),
                     "repos": repo_json,
                     "active_sessions": active_sessions,
+                    "default_model": default_model,
                     "cpu_percent": "—",
                     "uptime_secs": uptime_secs,
                 }));
@@ -3287,6 +3316,7 @@ async fn status_handler(
                     "version": env!("CARGO_PKG_VERSION"),
                     "repos": repo_json,
                     "active_sessions": active_sessions,
+                    "default_model": default_model,
                     "cpu_percent": "—",
                     "uptime_secs": uptime_secs,
                 }));
@@ -3319,6 +3349,7 @@ async fn status_handler(
         "version": env!("CARGO_PKG_VERSION"),
         "repos": repo_json,
         "active_sessions": active_sessions,
+        "default_model": default_model,
         "cpu_percent": cpu,
         "csharp_helper": csharp_helper,
         "ts_helper": ts_helper,
@@ -3997,6 +4028,29 @@ struct AddRepoRequest {
     model: Option<String>,
 }
 
+/// Decide the embedding model a `POST /repos` add should index with.
+///
+/// Precedence:
+/// 1. an explicit `model` in the request always wins (it forces a rebuild at
+///    that model's dimension, which is the documented `index add --model`
+///    behavior);
+/// 2. otherwise the serve-wide default (`codesearch serve --model`) applies
+///    **only when no model is recorded on disk** — i.e. this call is creating a
+///    brand-new index;
+/// 3. an index that already records its own model keeps it, exactly as if
+///    `--model` had not been passed.
+fn resolve_add_repo_model(
+    explicit: Option<crate::embed::ModelType>,
+    recorded: Option<crate::embed::ModelType>,
+    serve_default: Option<crate::embed::ModelType>,
+) -> Option<crate::embed::ModelType> {
+    explicit.or(if recorded.is_none() {
+        serve_default
+    } else {
+        None
+    })
+}
+
 /// Add-repo handler: POST /repos
 ///
 /// Registers a new repo in repos.json, opens the LMDB/Tantivy stores inline
@@ -4038,12 +4092,16 @@ async fn add_repo_handler(
         );
     }
 
+    // db_path is resolved before the model decision: whether a serve-wide
+    // default applies depends on whether the index already records a model.
+    let db_path = canonical_path.join(DB_DIR_NAME);
+
     // Parse the optional model override BEFORE opening the store: a fresh index
     // must be created at the override's dimension, not the 384-dim default.
     // Previously the store was opened at the default (or the previous metadata's)
     // dimension and the override was only applied to metadata afterwards, so the
     // reindex embedded 768-dim vectors into a 384-dim store and indexed nothing.
-    let model_override: Option<crate::embed::ModelType> = match body.model.as_deref() {
+    let explicit_model: Option<crate::embed::ModelType> = match body.model.as_deref() {
         Some(model_str) => match crate::embed::ModelType::parse(model_str) {
             Some(mt) => Some(mt),
             None => {
@@ -4058,6 +4116,17 @@ async fn add_repo_handler(
         },
         None => None,
     };
+
+    // `codesearch serve --model X` sets the default for indexes created here.
+    // It applies only when no explicit `model` was given AND this POST is
+    // creating a brand-new index: an existing index keeps the model recorded in
+    // its `metadata.json`, exactly as if the flag had not been set. An explicit
+    // `model` still wins and rebuilds at that model's dimension.
+    let model_override = resolve_add_repo_model(
+        explicit_model,
+        crate::embed::ModelType::from_index_metadata(&db_path),
+        state.default_model(),
+    );
 
     // Register in repos.json
     let alias = {
@@ -4116,7 +4185,6 @@ async fn add_repo_handler(
     // This eliminates the LMDB double-open race that occurred when the old
     //  path opened its own LMDB handle, conflicting with
     //  calls from the serve's request handlers.
-    let db_path = canonical_path.join(DB_DIR_NAME);
     let stores = match state.try_open_stores(
         &alias,
         &db_path,
@@ -4991,10 +5059,16 @@ fn keep_warm_foreign_target(ping_url: &str, self_host: &str) -> Option<String> {
     }
 }
 
+// `run_serve` is the single startup entry point, so its parameter list is the
+// serve CLI surface (bind host/port, registration, default model, TUI,
+// keep-warm, shutdown). Bundling them into a struct would only move the
+// plumbing; allow the wide signature instead.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_serve(
     host: Option<String>,
     port: Option<u16>,
     register_paths: Vec<PathBuf>,
+    default_model: Option<crate::embed::ModelType>,
     no_tui: bool,
     keep_warm_url: Option<String>,
     idle_suspend_secs: Option<u64>,
@@ -5078,7 +5152,7 @@ pub async fn run_serve(
     // env > default); nothing else consumes it, so `ServeState` does not carry
     // it. In particular the embedded TUI must NOT derive a poll cadence from it
     // — it never polls a federated peer on a timer at all.
-    let serve_state = Arc::new(ServeState::new(config, None));
+    let serve_state = Arc::new(ServeState::new(config, None).with_default_model(default_model));
 
     // Construct the bind address from resolved host + port.
     // Using `format!` with `parse::<SocketAddr>()` handles both IPv4 and IPv6.
@@ -5111,6 +5185,20 @@ pub async fn run_serve(
     let repo_list = format!("{:?}", serve_state.aliases());
     info!("📋 Registered repos: {}", repo_list);
     eprintln!("📋 Registered repos: {}", repo_list);
+
+    // Report the serve-wide default model for newly created indexes, if set.
+    // Without this, `serve --model X` is a silent setting: the TUI/status show
+    // per-repo models, but nothing tells an operator what a new `POST /repos`
+    // (or a delegated `codesearch index add`) will use.
+    if let Some(model) = default_model {
+        let line = format!(
+            "🧠 Default model for new indexes: {} ({} dims)",
+            model.short_name(),
+            model.dimensions()
+        );
+        info!("{}", line);
+        eprintln!("{}", line);
+    }
 
     // ── Start HTTP server FIRST ──
     // Accept connections immediately so MCP clients don't time out.
