@@ -155,6 +155,11 @@ impl CodesearchService {
             let mut max_chunk_id = 0u32;
             let mut dimensions = 0usize;
             let mut all_indexed = true;
+            // Separate from `all_indexed`: a store that FAILED to report stats
+            // must not make the summary claim "not built" (the failure already
+            // rides the `warnings` channel). This tracks only the graph state of
+            // stores that answered.
+            let mut all_built = true;
             let aliases = ctx.aliases();
             let mut stats_warnings: Vec<String> = Vec::new();
             let mut failed_count = 0usize;
@@ -173,6 +178,7 @@ impl CodesearchService {
                         }
                         if !stats.indexed {
                             all_indexed = false;
+                            all_built = false;
                         }
                     }
                     // `all_indexed = false` alone renders identically to "still
@@ -189,7 +195,7 @@ impl CodesearchService {
             }
 
             let (status, status_message) =
-                index_status_summary(sv.len(), failed_count, total_chunks);
+                index_status_summary(sv.len(), failed_count, total_chunks, all_built);
 
             let response = IndexStatusResponse {
                 indexed: all_indexed,
@@ -241,18 +247,9 @@ impl CodesearchService {
             }
         };
 
-        // Determine status based on database state
-        let (status, status_message) = if stats.total_chunks == 0 {
-            (
-                "building".to_string(),
-                "Index is being built in the background. Searches may fail until indexing completes. Please check back in a few minutes.".to_string(),
-            )
-        } else {
-            (
-                "ready".to_string(),
-                "Index is ready for searching.".to_string(),
-            )
-        };
+        // Determine status based on database state. `stats.indexed` (the HNSW
+        // graph is built) is load-bearing — see `single_index_status`.
+        let (status, status_message) = single_index_status(stats.total_chunks, stats.indexed);
 
         let response = IndexStatusResponse {
             indexed: stats.indexed,
