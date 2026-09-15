@@ -2518,3 +2518,42 @@ fn serve_service_uses_repo_model_not_default() {
         crate::embed::ModelType::default()
     );
 }
+
+/// The grouped `status` model label must reflect the members' recorded models,
+/// not the service default: a same-model group names that model, a mixed-model
+/// hub says `mixed`. Regression guard for the status field reporting the
+/// hardcoded default (`minilm-l6-q`) for every repo.
+#[test]
+fn group_status_model_label_is_common_or_mixed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_file = tmp.path().join("repos.json");
+    let mut config = ReposConfig::default();
+    for (alias, model) in [("legacy", "minilm-l6-q"), ("rebuilt", "embeddinggemma-q4")] {
+        let repo_path = tmp.path().join(alias);
+        std::fs::create_dir(&repo_path).unwrap();
+        config
+            .register_with_alias(repo_path.clone(), Some(alias.to_string()))
+            .unwrap();
+        let db_path = repo_path.join(DB_DIR_NAME);
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(
+            db_path.join("metadata.json"),
+            format!(r#"{{"model_short_name":"{model}"}}"#),
+        )
+        .unwrap();
+    }
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    assert_eq!(
+        svc.group_model_label(&["legacy".to_string(), "rebuilt".to_string()]),
+        "mixed",
+        "a hub holding indexes built with different models must report 'mixed'"
+    );
+    assert_eq!(
+        svc.group_model_label(&["rebuilt".to_string()]),
+        "embeddinggemma-q4",
+        "a single-model group must name its base model"
+    );
+}

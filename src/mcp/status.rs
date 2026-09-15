@@ -32,6 +32,29 @@ impl CodesearchService {
         }
     }
 
+    /// Model label for a grouped index-status response: the common model when
+    /// every member agrees, `"mixed"` when a hub holds indexes built with
+    /// different models.
+    ///
+    /// The status `model` field used to be the service's own model — the
+    /// hardcoded default in serve mode — so every repo read as `minilm-l6-q`
+    /// even when indexed with EmbeddingGemma. See the serve query-model fix.
+    pub(crate) fn group_model_label(&self, aliases: &[String]) -> String {
+        let mut common: Option<ModelType> = None;
+        for alias in aliases {
+            let model = self.query_model(Some(alias));
+            match common {
+                None => common = Some(model),
+                Some(prev) if prev != model => return "mixed".to_string(),
+                _ => {}
+            }
+        }
+        common
+            .unwrap_or_else(|| self.query_model(None))
+            .short_name()
+            .to_string()
+    }
+
     // ─────────────────────────────────────────────────────────────────
     /// Internal implementation for index_status with optional project/group routing.
     async fn index_status_impl(
@@ -174,7 +197,7 @@ impl CodesearchService {
                 status_message,
                 total_chunks,
                 total_files,
-                model: self.model_type.short_name().to_string(),
+                model: self.group_model_label(ctx.aliases()),
                 dimensions,
                 max_chunk_id,
                 db_path: format!("({} repos)", sv.len()),
@@ -202,7 +225,10 @@ impl CodesearchService {
                     status_message: format!("{}", e),
                     total_chunks: 0,
                     total_files: 0,
-                    model: self.model_type.short_name().to_string(),
+                    model: self
+                        .query_model(ctx.project_alias.as_deref())
+                        .short_name()
+                        .to_string(),
                     dimensions: 0,
                     max_chunk_id: 0,
                     db_path: self.db_path.display().to_string(),
@@ -234,7 +260,10 @@ impl CodesearchService {
             status_message,
             total_chunks: stats.total_chunks,
             total_files: stats.total_files,
-            model: self.model_type.short_name().to_string(),
+            model: self
+                .query_model(ctx.project_alias.as_deref())
+                .short_name()
+                .to_string(),
             dimensions: stats.dimensions,
             max_chunk_id: stats.max_chunk_id,
             db_path: self.db_path.display().to_string(),
