@@ -25,7 +25,7 @@ tokio = { version = "1.40", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 ctrlc = "3.4"
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 
 # ML & Embeddings
 fastembed = "6.1"

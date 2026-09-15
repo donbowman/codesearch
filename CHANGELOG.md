@@ -34,6 +34,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **TUI stack majors: ratatui 0.30, crossterm 0.29.** Zero call-site changes — the serve TUI sits on stable surface (`CrosstermBackend`, `Terminal`, `TableState`, `Paragraph`, `Layout`). This removes the last lru 0.12.5 path (ratatui's chain now carries lru 0.18.4; tantivy stays on the 0.16.4 that upstream 0.26 pins).
 
+- **thiserror 1.0 → 2.0 (direct).** Drop-in for all error enums (`#[error]`, `#[from]` unchanged); tantivy's chain still carries thiserror 1.x transitively until upstream moves.
+
 ## [1.3.19]
 
 ### Changed
