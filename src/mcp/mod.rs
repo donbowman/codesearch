@@ -196,6 +196,18 @@ impl Drop for CodesearchService {
     }
 }
 
+/// Outcome of resolving the embedding model for a query target.
+///
+/// See [`CodesearchService::resolve_query_model`].
+pub(crate) struct QueryModel {
+    /// The model the query must be embedded with.
+    pub model: ModelType,
+    /// A caller-facing warning, set when the target index records no model and
+    /// the built-in default was assumed. `None` when the model was recorded or
+    /// the query is scope-free.
+    pub assumed_warning: Option<String>,
+}
+
 // v1: supports prefix/suffix patterns with `*` and `**` only.
 /// Merge exact FTS results into the main result set, deduplicating by chunk_id
 /// and keeping the max score for duplicates.
@@ -902,10 +914,11 @@ impl CodesearchService {
     /// it routes requests to the repo identified by `project`/`group`.
     pub(crate) fn new_for_serve(serve_state: Arc<crate::serve::ServeState>) -> Result<Self> {
         let symbol_registry = serve_state.symbol_registry();
-        // Fall back to the serve-wide default model (`serve --model`) rather
-        // than the built-in default: the same value `POST /repos` stamps into
-        // a newly created index, so the unpinned status summary and any repo
-        // whose `metadata.json` records no model report/query with it.
+        // Seed the service with the serve-wide default model (`serve --model`),
+        // the same value `POST /repos` stamps into a newly created index, so the
+        // scope-free status summary reports it. It is deliberately NOT the query
+        // fallback for a repo whose metadata records no model — that resolves to
+        // the built-in default, with a warning. See `resolve_query_model`.
         let model_type = serve_state.default_model().unwrap_or_default();
         Ok(Self {
             tool_router: Self::merged_tool_router(),
@@ -934,19 +947,57 @@ impl CodesearchService {
 
     /// Resolve the embedding model a query against `alias` must use.
     ///
-    /// In serve mode (`project=` / group member), the model is read from that
+    /// With a repo alias (`project=` / group member) the model is read from that
     /// repo's index metadata — an index built with EmbeddingGemma must be
-    /// queried with EmbeddingGemma, not the 384-dim default. Falls back to the
-    /// service's own `model_type` (which is itself resolved from the local
-    /// index metadata in stdio mode) when there is no alias or the index does
-    /// not record a model.
+    /// queried with EmbeddingGemma, not the 384-dim default. A repo whose
+    /// metadata records no model is queried with the built-in default, never the
+    /// serve-wide `--model` default (see [`Self::resolve_query_model`]). With no
+    /// alias this returns the service's own `model_type`: the local index
+    /// metadata in stdio mode, the serve default in serve mode (the scope-free
+    /// status summary). Prefer [`Self::resolve_query_model`] when the caller can
+    /// surface the unrecorded-model warning.
     pub(crate) fn query_model(&self, alias: Option<&str>) -> ModelType {
+        self.resolve_query_model(alias).model
+    }
+
+    /// Resolve the query model together with a warning when it had to be assumed.
+    ///
+    /// The model a query is embedded with must match the model the target index
+    /// was built with. When `alias`'s metadata records no model the model is
+    /// unknowable, so this assumes the BUILT-IN default: that is both the
+    /// historical 384-dim behaviour and the value every other reader assumes for
+    /// metadata without a `model_short_name`. It deliberately does NOT assume the
+    /// serve-wide `--model` default: that flag selects the model for newly
+    /// created indexes, and using it here would break a working legacy repo the
+    /// moment an operator set it (a 384-dim index queried with a 768-dim model
+    /// fails, and a same-dimension model degrades rankings silently). The
+    /// returned warning names the repo, the assumption, and the re-index command.
+    pub(crate) fn resolve_query_model(&self, alias: Option<&str>) -> QueryModel {
         if let (Some(state), Some(alias)) = (self.serve_state.as_ref(), alias) {
             if let Some(model) = state.model_for_alias(alias) {
-                return model;
+                return QueryModel {
+                    model,
+                    assumed_warning: None,
+                };
             }
+            let model = ModelType::default();
+            let warning = format!(
+                "repo '{alias}' records no embedding model; queried with the built-in default '{}' ({} dims). If this repo was indexed with a different model, re-index it: codesearch index --force --model <name>",
+                model.short_name(),
+                model.dimensions()
+            );
+            if state.mark_legacy_model_warned(alias) {
+                tracing::warn!("{}", warning);
+            }
+            return QueryModel {
+                model,
+                assumed_warning: Some(warning),
+            };
         }
-        self.model_type
+        QueryModel {
+            model: self.model_type,
+            assumed_warning: None,
+        }
     }
 
     /// Get (lazily initializing) the embedding service for `model`.

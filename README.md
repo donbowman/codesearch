@@ -141,7 +141,11 @@ targets (mixed-model groups are fine). `codesearch serve --model <name>` sets a
 with it, and it is reported in `GET /status` as `default_model`. It never
 overrides an index that already records its own model — to change an existing
 repo's model, re-index that repo
-(`codesearch --model <name> index <path> --force`) and restart serve.
+(`codesearch --model <name> index <path> --force`) and restart serve. A repo
+whose `metadata.json` records no model (a legacy index built before the
+recording contract) is queried with the built-in 384-dim default rather than the
+serve default, and the search response carries a warning naming the assumed model
+and the re-index command.
 
 ## MCP Configuration
 

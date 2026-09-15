@@ -981,9 +981,10 @@ fn resolve_add_repo_model_precedence() {
     assert_eq!(resolve_add_repo_model(Some(mini), None, None), Some(mini));
 }
 
-/// The serve-wide default is the fallback query model in serve mode, so a repo
-/// whose `metadata.json` records no model is queried with it rather than the
-/// built-in default.
+/// The serve-wide default is the scope-free fallback model in serve mode (the
+/// unpinned status summary, a call with no routed alias). It is deliberately
+/// NOT the query fallback for a repo that records no model — see
+/// `unrecorded_index_is_queried_with_builtin_default_not_serve_default`.
 #[test]
 fn serve_default_model_is_service_fallback() {
     use crate::embed::ModelType;
@@ -1011,6 +1012,87 @@ fn no_serve_default_keeps_builtin_fallback() {
 
     let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
     assert_eq!(svc.query_model(None), ModelType::default());
+}
+
+/// A repo whose `metadata.json` records no model is queried with the BUILT-IN
+/// default, never the serve-wide `--model` default.
+///
+/// Regression guard for `serve --model X` silently overriding a legacy index:
+/// with a 768-dim serve default, a 384-dim legacy index failed every search with
+/// "Query embedding dimension mismatch: expected 384, got 768", and a
+/// same-dimension default would have compared incomparable vector spaces without
+/// erroring. The assumption must also reach the caller as a warning naming the
+/// repo, the assumed model and the re-index command.
+#[test]
+fn unrecorded_index_is_queried_with_builtin_default_not_serve_default() {
+    use crate::embed::ModelType;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config_file = tmp.path().join("repos.json");
+    let repo_path = tmp.path().join("legacy");
+    std::fs::create_dir(&repo_path).unwrap();
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(repo_path.clone(), Some("legacy".to_string()))
+        .unwrap();
+    config.save_to(&config_file).unwrap();
+
+    let state = std::sync::Arc::new(
+        ServeState::new(config, Some(config_file))
+            .with_default_model(Some(ModelType::EmbeddingGemma300MQ4)),
+    );
+    let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    // No metadata.json yet: an unrecorded model. Serve default is gemma.
+    let resolution = svc.resolve_query_model(Some("legacy"));
+    assert_eq!(
+        resolution.model,
+        ModelType::default(),
+        "a repo that records no model must be queried with the built-in default, \
+         not the '{}' serve default",
+        ModelType::EmbeddingGemma300MQ4.short_name()
+    );
+    let warning = resolution
+        .assumed_warning
+        .expect("the assumed model must be surfaced to the caller");
+    assert!(
+        warning.contains("legacy"),
+        "warning must name the repo: {warning}"
+    );
+    assert!(
+        warning.contains(ModelType::default().short_name()),
+        "warning must name the assumed model: {warning}"
+    );
+    assert!(
+        warning.contains("--force"),
+        "warning must give the re-index command: {warning}"
+    );
+
+    // A recorded model is used as-is and must not warn.
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"model_short_name":"embeddinggemma-q4","dimensions":768}"#,
+    )
+    .unwrap();
+    let resolution = svc.resolve_query_model(Some("legacy"));
+    assert_eq!(resolution.model, ModelType::EmbeddingGemma300MQ4);
+    assert!(
+        resolution.assumed_warning.is_none(),
+        "a recorded model must not warn"
+    );
+}
+
+/// The unrecorded-model log warning fires once per alias, so a busy hub does not
+/// repeat the same line on every query. The caller-facing warning is separate
+/// and is not deduped.
+#[test]
+fn legacy_model_warning_is_logged_once_per_alias() {
+    let state = ServeState::new(ReposConfig::default(), None);
+    assert!(state.mark_legacy_model_warned("a"));
+    assert!(!state.mark_legacy_model_warned("a"));
+    assert!(state.mark_legacy_model_warned("b"));
 }
 
 /// `persist_config` must write to the override path (and therefore be

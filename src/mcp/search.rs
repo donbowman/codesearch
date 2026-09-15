@@ -172,12 +172,14 @@ impl CodesearchService {
         }
 
         // === Modes: "semantic", "hybrid", "auto" — require embedding ===
+        // The query MUST be embedded with the model the target index was built
+        // with. In serve mode that is the routed repo's recorded model, not a
+        // hub-wide default: a 384-dim query against a 768-dim EmbeddingGemma
+        // index failed with "expected 768, got 384". A repo that records no
+        // model is queried with the built-in default, and the caller is warned.
+        let model_resolution = self.resolve_query_model(ctx.project_alias.as_deref());
         let query_embedding = {
-            // The query MUST be embedded with the model the target index was
-            // built with. In serve mode that is the routed repo's recorded model,
-            // not a hub-wide default: a 384-dim query against a 768-dim
-            // EmbeddingGemma index failed with "expected 768, got 384".
-            let model = self.query_model(ctx.project_alias.as_deref());
+            let model = model_resolution.model;
             let service = match self.embedding_service_for(model) {
                 Ok(s) => s,
                 Err(e) => {
@@ -209,6 +211,11 @@ impl CodesearchService {
         // here, `project=<alias>` — the form an agent uses most — still reports
         // a broken store as an ordinary empty result.
         let mut single_warnings: Vec<String> = Vec::new();
+        // Surface the assumed-model warning even when the store read succeeds:
+        // mismatched vector spaces do not error, they just rank wrongly.
+        if let Some(warning) = model_resolution.assumed_warning {
+            single_warnings.push(warning);
+        }
 
         // Search vector store
         let vector_results = match self
@@ -583,11 +590,19 @@ impl CodesearchService {
         // expected 768, got 384" on a mixed hub.
         let mut embeddings_by_alias: std::collections::HashMap<String, Vec<f32>> =
             std::collections::HashMap::with_capacity(aliases.len());
+        // Assumed-model warnings, one per repo that records no model. Collected
+        // here and folded into `search_warnings` below so an agent sees the
+        // assumption alongside the results it applies to.
+        let mut model_warnings: Vec<String> = Vec::new();
         {
             let mut by_model: std::collections::HashMap<crate::embed::ModelType, Vec<f32>> =
                 std::collections::HashMap::new();
             for alias in aliases {
-                let model = self.query_model(Some(alias));
+                let model_resolution = self.resolve_query_model(Some(alias));
+                let model = model_resolution.model;
+                if let Some(warning) = model_resolution.assumed_warning {
+                    model_warnings.push(warning);
+                }
                 let embedding = match by_model.get(&model) {
                     Some(cached) => cached.clone(),
                     None => {
@@ -639,7 +654,8 @@ impl CodesearchService {
 
         // Warnings raised by the fan-out, carried into the response so the
         // calling agent can tell "not in the corpus" from "that repo is down".
-        let mut search_warnings: Vec<String> = Vec::new();
+        // Seeded with any assumed-model warnings gathered while embedding.
+        let mut search_warnings: Vec<String> = model_warnings;
 
         let vector_results =
             match outcome {

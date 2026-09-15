@@ -283,11 +283,19 @@ pub(crate) struct ServeState {
     /// Serve-wide default embedding model for newly created indexes
     /// (`codesearch serve --model <name>`), or `None` for the built-in default.
     ///
-    /// This never overrides an index that already records its own model: it
+    /// This never overrides an index that already records its own model, and it
+    /// is deliberately NOT the query fallback for an index that records none:
+    /// a legacy index with no `model_short_name` is queried with the built-in
+    /// default and reported with a warning (see
+    /// `CodesearchService::resolve_query_model`). Applying this flag there would
+    /// break a working legacy repo the moment an operator set it. The default
     /// applies only when `POST /repos` creates a brand-new index without an
-    /// explicit `model`, and as the fallback query model for a repo whose
-    /// `metadata.json` has no recorded model.
+    /// explicit `model`, and to the scope-free status summary.
     default_model: Option<crate::embed::ModelType>,
+    /// Aliases for which the unrecorded-model query warning has already been
+    /// emitted, so a long-running serve logs it once per repo instead of once
+    /// per query. See [`Self::mark_legacy_model_warned`].
+    legacy_model_warned: DashMap<String, ()>,
     /// Per-repo total tool call count.
     tool_call_counts: DashMap<String, AtomicU64>,
     /// Per-repo C# symbol index status (cached, updated on rebuild/detect).
@@ -371,6 +379,7 @@ impl ServeState {
                 crate::constants::get_global_models_cache_dir().ok(),
             )),
             default_model: None,
+            legacy_model_warned: DashMap::new(),
             tool_call_counts: DashMap::new(),
             csharp_index_status: Arc::new(DashMap::new()),
             csharp_index_error: Arc::new(DashMap::new()),
@@ -499,6 +508,20 @@ impl ServeState {
         let cfg = self.config_snapshot();
         let project_path = cfg.resolve(alias)?;
         crate::embed::ModelType::from_index_metadata(&project_path.join(DB_DIR_NAME))
+    }
+
+    /// Record that `alias` was queried with the built-in default because its
+    /// index records no embedding model, returning `true` on the first call for
+    /// that alias.
+    ///
+    /// An unrecorded model is unknowable, so the fallback warning is logged once
+    /// per repo per serve lifetime rather than on every query — a busy hub would
+    /// otherwise flood the log with the same line. The caller-facing response
+    /// warning is not deduped: an agent should see the assumption on each answer.
+    pub(crate) fn mark_legacy_model_warned(&self, alias: &str) -> bool {
+        self.legacy_model_warned
+            .insert(alias.to_string(), ())
+            .is_none()
     }
 
     /// Return the instant when serve started, used to compute uptime.
