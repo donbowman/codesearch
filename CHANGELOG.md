@@ -40,6 +40,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **File-watch stack majors: notify 6.1 → 8.2, notify-debouncer-full 0.3 → 0.7.** The debouncer absorbed `Watcher` into `Debouncer` itself (`debouncer.watch()/unwatch()` replace `.watcher().watch()`), and root cache tracking is now automatic, so the explicit `cache().add_root()` call goes away. The watcher's cache type now follows upstream's per-platform recommendation (`RecommendedCache`: `FileIdMap` on Windows/macOS, `NoCache` on Linux — file-ID tracking is an internal rename-detection optimization; event mapping never reads file IDs directly). Also removes `mio 0.8.11` from the lock entirely (it rode the Linux-only inotify 0.9 path; notify 8 uses inotify 0.11).
 
+- **tree-sitter 0.26 → 0.27, tree-sitter-proto 0.4 → 0.6.** Zero call-site changes — the chunker sits on the stable `Parser`/`Language` surface and grammars load through the ABI-stable `LANGUAGE.into()` (`tree-sitter-language`) route, so all 17 grammar crates stay pinned while the core moves a major.
+
 ## [1.3.19]
 
 ### Changed
