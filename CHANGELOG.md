@@ -36,6 +36,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **axum 0.7 → 0.8.** The only breaking surface hit: path parameters changed syntax from `:param` to `{param}` — all route registrations (`/repos/:alias*`, `/chunk/:id`) and the shared `CHUNK_PATH` constant move to brace syntax, including the federation client's URL templating that derives from the same constant. Extractors, middleware and `axum::serve` compile unchanged; the serve + federation test suites exercise the rebuilt router end-to-end.
 
+- **thiserror 1.0 → 2.0 (direct).** Drop-in for all error enums (`#[error]`, `#[from]` unchanged); tantivy's chain still carries thiserror 1.x transitively until upstream moves.
+
 ## [1.3.19]
 
 ### Changed
