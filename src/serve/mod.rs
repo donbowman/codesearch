@@ -269,12 +269,17 @@ pub(crate) struct ServeState {
     /// `find_impact` to reuse helper-detection cache instead of creating fresh
     /// instances per request.
     symbol_registry: Arc<SymbolIndexerRegistry>,
-    /// Shared embedding service — used by MCP sessions AND the REST handlers so
-    /// the ONNX embedding model is loaded ONCE per serve instance (lazily, on
-    /// the first semantic query) and reused across all requests. Without this,
-    /// per-request `CodesearchService` construction (REST handlers) would reload
-    /// the model on every call (~100ms–2s). Mirrors the `symbol_registry` pattern.
-    embedding_service: Arc<std::sync::Mutex<Option<crate::embed::EmbeddingService>>>,
+    /// Shared, per-model embedding-service pool — used by MCP sessions AND the
+    /// REST handlers so each ONNX embedding model is loaded ONCE per serve
+    /// instance (lazily, on the first semantic query) and reused across all
+    /// requests. Without this, per-request `CodesearchService` construction
+    /// (REST handlers) would reload the model on every call (~100ms–2s).
+    ///
+    /// A pool rather than a single service because serve is multi-repo and
+    /// indexes may be built with different models: every query must be embedded
+    /// with the model of the repo it targets. Mirrors the `symbol_registry`
+    /// pattern.
+    embedding_pool: Arc<crate::embed::EmbeddingServicePool>,
     /// Per-repo total tool call count.
     tool_call_counts: DashMap<String, AtomicU64>,
     /// Per-repo C# symbol index status (cached, updated on rebuild/detect).
@@ -354,7 +359,9 @@ impl ServeState {
             total_sessions: AtomicU64::new(0),
             sysinfo_system: std::sync::Mutex::new(sys),
             symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
-            embedding_service: Arc::new(std::sync::Mutex::new(None)),
+            embedding_pool: Arc::new(crate::embed::EmbeddingServicePool::new(
+                crate::constants::get_global_models_cache_dir().ok(),
+            )),
             tool_call_counts: DashMap::new(),
             csharp_index_status: Arc::new(DashMap::new()),
             csharp_index_error: Arc::new(DashMap::new()),
@@ -447,14 +454,27 @@ impl ServeState {
         Arc::clone(&self.symbol_registry)
     }
 
-    /// Return a clone of the shared embedding-service Arc.
-    /// Shared across MCP sessions AND REST handlers so the ONNX model is loaded
+    /// Return a clone of the shared, per-model embedding-service pool.
+    /// Shared across MCP sessions AND REST handlers so each ONNX model is loaded
     /// once per serve instance (lazily on first semantic query) instead of being
     /// reloaded per request/session.
-    pub(crate) fn embedding_service(
-        &self,
-    ) -> Arc<std::sync::Mutex<Option<crate::embed::EmbeddingService>>> {
-        Arc::clone(&self.embedding_service)
+    pub(crate) fn embedding_pool(&self) -> Arc<crate::embed::EmbeddingServicePool> {
+        Arc::clone(&self.embedding_pool)
+    }
+
+    /// Resolve the embedding model an alias's index was built with.
+    ///
+    /// Returns `None` when the alias is unknown or its index has no
+    /// `model_short_name` (unindexed / legacy), so callers can fall back to
+    /// [`crate::embed::ModelType::default`]. This is the read side of the
+    /// per-repo model contract: a query against `alias` MUST be embedded with
+    /// the model returned here, or the vector search fails with a dimension
+    /// mismatch (768-dim EmbeddingGemma index, 384-dim default query) or
+    /// silently compares incomparable vector spaces.
+    pub(crate) fn model_for_alias(&self, alias: &str) -> Option<crate::embed::ModelType> {
+        let cfg = self.config_snapshot();
+        let project_path = cfg.resolve(alias)?;
+        crate::embed::ModelType::from_index_metadata(&project_path.join(DB_DIR_NAME))
     }
 
     /// Return the instant when serve started, used to compute uptime.

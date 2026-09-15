@@ -2404,3 +2404,117 @@ fn evicting_idle_repo_clears_frozen_csharp_error_state() {
         "eviction must clear the cached C# error message along with the status"
     );
 }
+
+/// The model a serve query is embedded with is read from the routed repo's own
+/// index metadata — never assumed to be the hub-wide default.
+///
+/// Regression guard for the serve hub pinning `ModelType::default()` (384-dim
+/// MiniLM) for every query: on a hub whose indexes were rebuilt with
+/// EmbeddingGemma that failed with "Query embedding dimension mismatch:
+/// expected 768, got 384". Reintroducing the default pin makes the gemma cases
+/// below fail.
+#[test]
+fn model_for_alias_reads_the_index_metadata_model() {
+    let cases = [
+        (
+            "embeddinggemma-q4",
+            Some(crate::embed::ModelType::EmbeddingGemma300MQ4),
+        ),
+        ("minilm-l6-q", Some(crate::embed::ModelType::AllMiniLML6V2Q)),
+        ("bge-base", Some(crate::embed::ModelType::BGEBaseENV15)),
+        // An unknown recorded name must not be silently coerced to the default:
+        // callers fall back explicitly, and the resolver reports "no answer".
+        ("not-a-real-model", None),
+    ];
+
+    for (model_short_name, expected) in cases {
+        let (_tmp, repo_path, state) = state_with_repo("repo");
+        let db_path = repo_path.join(DB_DIR_NAME);
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(
+            db_path.join("metadata.json"),
+            format!(r#"{{"model_short_name":"{model_short_name}","dimensions":768}}"#),
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.model_for_alias("repo"),
+            expected,
+            "metadata model_short_name '{model_short_name}' must drive the query model"
+        );
+    }
+}
+
+/// Missing metadata (unindexed / legacy index) yields `None`, so the caller's
+/// documented fallback to the default applies — and an unknown alias cannot
+/// borrow another repo's model.
+#[test]
+fn model_for_alias_is_none_without_index_metadata() {
+    let (_tmp, _repo_path, state) = state_with_repo("repo");
+    assert_eq!(state.model_for_alias("repo"), None);
+    assert_eq!(state.model_for_alias("not-registered"), None);
+}
+
+/// A single hub can hold indexes built with different models: each alias
+/// resolves independently, so a group fan-out embeds each store's query with
+/// that store's own model.
+#[test]
+fn model_for_alias_is_per_repo_not_hub_wide() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_file = tmp.path().join("repos.json");
+    let mut config = ReposConfig::default();
+    for (alias, model) in [("legacy", "minilm-l6-q"), ("rebuilt", "embeddinggemma-q4")] {
+        let repo_path = tmp.path().join(alias);
+        std::fs::create_dir(&repo_path).unwrap();
+        config
+            .register_with_alias(repo_path.clone(), Some(alias.to_string()))
+            .unwrap();
+        let db_path = repo_path.join(DB_DIR_NAME);
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(
+            db_path.join("metadata.json"),
+            format!(r#"{{"model_short_name":"{model}"}}"#),
+        )
+        .unwrap();
+    }
+    config.save_to(&config_file).unwrap();
+    let state = ServeState::new(config, Some(config_file));
+
+    assert_eq!(
+        state.model_for_alias("legacy"),
+        Some(crate::embed::ModelType::AllMiniLML6V2Q)
+    );
+    assert_eq!(
+        state.model_for_alias("rebuilt"),
+        Some(crate::embed::ModelType::EmbeddingGemma300MQ4)
+    );
+}
+
+/// The serve MCP service resolves the query model through the routed repo, not
+/// its own (default) field. This is the exact seam the hub got wrong: it is the
+/// service, not `ServeState`, that hands the model to the embedder.
+#[test]
+fn serve_service_uses_repo_model_not_default() {
+    let (_tmp, repo_path, state) = state_with_repo("gemma-repo");
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"model_short_name":"embeddinggemma-q4","dimensions":768}"#,
+    )
+    .unwrap();
+
+    let svc = crate::mcp::CodesearchService::new_for_serve(std::sync::Arc::new(state)).unwrap();
+
+    assert_eq!(
+        svc.query_model(Some("gemma-repo")),
+        crate::embed::ModelType::EmbeddingGemma300MQ4,
+        "serve must embed a repo's queries with the model that repo was indexed with"
+    );
+    // No alias (unscoped) or an unknown alias falls back to the service default.
+    assert_eq!(svc.query_model(None), crate::embed::ModelType::default());
+    assert_eq!(
+        svc.query_model(Some("not-registered")),
+        crate::embed::ModelType::default()
+    );
+}

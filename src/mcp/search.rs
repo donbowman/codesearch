@@ -173,8 +173,13 @@ impl CodesearchService {
 
         // === Modes: "semantic", "hybrid", "auto" — require embedding ===
         let query_embedding = {
-            let mut service_guard = match self.get_embedding_service() {
-                Ok(g) => g,
+            // The query MUST be embedded with the model the target index was
+            // built with. In serve mode that is the routed repo's recorded model,
+            // not a hub-wide default: a 384-dim query against a 768-dim
+            // EmbeddingGemma index failed with "expected 768, got 384".
+            let model = self.query_model(ctx.project_alias.as_deref());
+            let service = match self.embedding_service_for(model) {
+                Ok(s) => s,
                 Err(e) => {
                     tracing::error!("MCP: Failed to get embedding service: {:?}", e);
                     return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
@@ -183,8 +188,11 @@ impl CodesearchService {
                 }
             };
 
-            let service = service_guard.as_mut().unwrap();
-            tracing::debug!("MCP: Embedding query...");
+            let mut service = service.lock().unwrap();
+            tracing::debug!(
+                "MCP: Embedding query with model '{}'...",
+                model.short_name()
+            );
             match service.embed_query(&request.query) {
                 Ok(e) => e,
                 Err(e) => {
@@ -567,32 +575,61 @@ impl CodesearchService {
         }
 
         // === Modes requiring embedding: "semantic", "hybrid", "auto" ===
-        let query_embedding = {
-            let mut service_guard = match self.get_embedding_service() {
-                Ok(g) => g,
-                Err(e) => {
-                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                        "Error initializing embedding service: {e:#}"
-                    ))]));
-                }
-            };
-            let service = service_guard.as_mut().unwrap();
-            match service.embed_query(&request.query) {
-                Ok(e) => e,
-                Err(e) => {
-                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                        "Error embedding query: {e:#}"
-                    ))]));
-                }
+        //
+        // Each repo may have been indexed with a different model, so the query
+        // is embedded once per distinct model and every store is searched with
+        // the embedding of ITS model. Embedding all stores with one hub-wide
+        // default is what produced "Query embedding dimension mismatch:
+        // expected 768, got 384" on a mixed hub.
+        let mut embeddings_by_alias: std::collections::HashMap<String, Vec<f32>> =
+            std::collections::HashMap::with_capacity(aliases.len());
+        {
+            let mut by_model: std::collections::HashMap<crate::embed::ModelType, Vec<f32>> =
+                std::collections::HashMap::new();
+            for alias in aliases {
+                let model = self.query_model(Some(alias));
+                let embedding = match by_model.get(&model) {
+                    Some(cached) => cached.clone(),
+                    None => {
+                        let service = match self.embedding_service_for(model) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                return Ok(CallToolResult::success(vec![ContentBlock::text(
+                                    format!(
+                                        "Error initializing embedding service for '{alias}': {e:#}"
+                                    ),
+                                )]));
+                            }
+                        };
+                        let mut service = service.lock().unwrap();
+                        let embedding = match service.embed_query(&request.query) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                return Ok(CallToolResult::success(vec![ContentBlock::text(
+                                    format!("Error embedding query: {e:#}"),
+                                )]));
+                            }
+                        };
+                        by_model.insert(model, embedding.clone());
+                        embedding
+                    }
+                };
+                embeddings_by_alias.insert(alias.clone(), embedding);
             }
-        };
+        }
 
-        // Search vector stores across all repos
+        // Search vector stores across all repos, each with its own model's
+        // query embedding.
         let outcome = self
             .with_vector_store_read_multi(
-                |store| {
+                |alias, store| {
+                    let embedding = embeddings_by_alias.get(alias).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "internal error: no query embedding resolved for repo '{alias}'"
+                        )
+                    })?;
                     store
-                        .search(&query_embedding, limit * 5)
+                        .search(embedding, limit * 5)
                         .context("Error searching vector store")
                 },
                 stores.clone(),

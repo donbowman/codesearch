@@ -28,7 +28,7 @@ fn serve_url_from_env() -> String {
 }
 
 use crate::db_discovery::{find_best_database, load_repos_config};
-use crate::embed::{EmbeddingService, ModelType};
+use crate::embed::{EmbeddingServicePool, ModelType};
 use crate::file::Language;
 use crate::fts::FtsStore;
 use crate::index::SharedStores;
@@ -148,8 +148,10 @@ pub struct CodesearchService {
     project_path: PathBuf,
     model_type: ModelType,
     dimensions: usize,
-    // Lazily initialized on first search
-    embedding_service: Arc<Mutex<Option<EmbeddingService>>>,
+    // Lazily initialized on first search. A per-model pool: serve mode is
+    // multi-repo and each index records the model it was built with, so the
+    // query model is resolved per target repo (see `query_model`).
+    embedding_pool: Arc<EmbeddingServicePool>,
     // Shared stores for concurrent access (optional - only set when running with IndexManager)
     shared_stores: Option<Arc<SharedStores>>,
     // Serve-mode state (set when running inside `codesearch serve`)
@@ -884,7 +886,9 @@ impl CodesearchService {
             project_path,
             model_type,
             dimensions,
-            embedding_service: Arc::new(Mutex::new(None)),
+            embedding_pool: Arc::new(EmbeddingServicePool::new(
+                crate::constants::get_global_models_cache_dir().ok(),
+            )),
             shared_stores,
             serve_state: None,
             symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
@@ -904,7 +908,7 @@ impl CodesearchService {
             project_path: PathBuf::from("serve://multi-repo"),
             model_type: ModelType::default(),
             dimensions: crate::constants::DEFAULT_EMBEDDING_DIMENSIONS,
-            embedding_service: serve_state.embedding_service(),
+            embedding_pool: serve_state.embedding_pool(),
             shared_stores: None,
             serve_state: Some(serve_state),
             symbol_registry,
@@ -923,17 +927,33 @@ impl CodesearchService {
         self.tracks_session = true;
     }
 
-    /// Get or initialize the embedding service
-    fn get_embedding_service(&self) -> Result<std::sync::MutexGuard<'_, Option<EmbeddingService>>> {
-        let mut guard = self.embedding_service.lock().unwrap();
-        if guard.is_none() {
-            let cache_dir = crate::constants::get_global_models_cache_dir()?;
-            *guard = Some(EmbeddingService::with_cache_dir(
-                self.model_type,
-                Some(&cache_dir),
-            )?);
+    /// Resolve the embedding model a query against `alias` must use.
+    ///
+    /// In serve mode (`project=` / group member), the model is read from that
+    /// repo's index metadata — an index built with EmbeddingGemma must be
+    /// queried with EmbeddingGemma, not the 384-dim default. Falls back to the
+    /// service's own `model_type` (which is itself resolved from the local
+    /// index metadata in stdio mode) when there is no alias or the index does
+    /// not record a model.
+    pub(crate) fn query_model(&self, alias: Option<&str>) -> ModelType {
+        if let (Some(state), Some(alias)) = (self.serve_state.as_ref(), alias) {
+            if let Some(model) = state.model_for_alias(alias) {
+                return model;
+            }
         }
-        Ok(guard)
+        self.model_type
+    }
+
+    /// Get (lazily initializing) the embedding service for `model`.
+    ///
+    /// The returned `Arc<Mutex<..>>` is per-model, so concurrent queries against
+    /// different models do not serialise on one global lock. Callers MUST pass
+    /// the model the target index was built with — see [`Self::query_model`].
+    pub(crate) fn embedding_service_for(
+        &self,
+        model: ModelType,
+    ) -> Result<Arc<Mutex<crate::embed::EmbeddingService>>> {
+        self.embedding_pool.get(model)
     }
 
     /// Return the current MCP mode as a string for diagnostics.
@@ -1247,8 +1267,11 @@ impl CodesearchService {
 
     /// Fan-out vector store read across multiple stores, merging results.
     ///
-    /// Runs `action` against each store and merges all results into a single vec,
-    /// deduplicating by (alias, chunk_id) (keeping highest score) and sorting by score descending.
+    /// Runs `action(alias, store)` against each store and merges all results into
+    /// a single vec, deduplicating by (alias, chunk_id) (keeping highest score)
+    /// and sorting by score descending. The `alias` is passed to the closure so
+    /// callers can select per-repo state — notably the query embedding for that
+    /// repo's own model (see `semantic_search_multi`).
     ///
     /// A per-store failure does NOT abort the fan-out — one broken repo should
     /// not blind a group query to the healthy ones — but it is reported back in
@@ -1261,7 +1284,7 @@ impl CodesearchService {
         aliases: &[String],
     ) -> Result<MultiReadOutcome<R>>
     where
-        F: FnMut(&VectorStore) -> anyhow::Result<Vec<R>>,
+        F: FnMut(&str, &VectorStore) -> anyhow::Result<Vec<R>>,
         R: Clone + HasChunkId + HasScore,
     {
         let mut failures: Vec<(String, String)> = Vec::new();
@@ -1272,7 +1295,7 @@ impl CodesearchService {
         for (idx, store_arc) in stores.iter().enumerate() {
             let alias = aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown");
             let store = store_arc.vector_store.read().await;
-            match action(&store) {
+            match action(alias, &store) {
                 Ok(results) => {
                     for r in results {
                         let key = (alias.to_string(), r.chunk_id());

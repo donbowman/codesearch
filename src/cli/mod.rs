@@ -1222,6 +1222,17 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     if let Err(e) = crate::logger::init_serve_logger(log_level, effective_quiet) {
                         eprintln!("Warning: failed to initialize serve logger: {}", e);
                     }
+                    // `--model` is a global flag inherited by every subcommand, but
+                    // serve resolves each repo's model from its own index metadata
+                    // (a hub can hold indexes built with different models). Say so
+                    // rather than silently ignoring the flag.
+                    if model_type.is_some() {
+                        eprintln!(
+                            "Warning: `--model` does not apply to `serve` — each repo's embedding \
+                             model is read from its own index metadata. To change a repo's model, \
+                             re-index it: `codesearch --model <name> index <path> --force`."
+                        );
+                    }
                     crate::serve::run_serve(
                         host,
                         port,

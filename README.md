@@ -132,6 +132,13 @@ spaces are model-specific. Keep the same model selected for later indexing runs.
 Search rejects a `--model` value that differs from the indexed model and points
 to the required `--force` rebuild instead of mixing incompatible vector spaces.
 
+In **serve** mode the model is resolved **per repository**, from each index's own
+metadata, not from a hub-wide setting: a hub may hold indexes built with
+different models, and every query is embedded with the model of the repo it
+targets (mixed-model groups are fine). Consequently `--model` has no effect on
+`codesearch serve` — to change a repo's model, re-index that repo
+(`codesearch --model <name> index <path> --force`) and restart serve.
+
 ## MCP Configuration
 
 codesearch connects to AI agents via MCP. Two modes:
