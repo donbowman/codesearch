@@ -6,7 +6,7 @@
 use super::*;
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content},
+    model::{CallToolResult, ContentBlock},
     tool, tool_router, ErrorData as McpError,
 };
 
@@ -94,7 +94,7 @@ impl CodesearchService {
                 };
                 self.literal_search(Parameters(literal_req)).await
             }
-            _ => Ok(CallToolResult::success(vec![Content::text(format!(
+            _ => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Unknown search mode '{}'. Use `semantic` or `literal`.",
                 mode
             ))])),
@@ -115,7 +115,7 @@ impl CodesearchService {
             .await
         {
             Ok(c) => c,
-            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+            Err(e) => return Ok(CallToolResult::success(vec![ContentBlock::text(e)])),
         };
 
         let limit = request.limit.unwrap_or(10);
@@ -136,7 +136,7 @@ impl CodesearchService {
         // Ensure database exists (skip if serve-mode with routed stores)
         if ctx.needs_local_db {
             if let Err(e) = self.ensure_database_exists() {
-                return Ok(CallToolResult::success(vec![Content::text(e)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(e)]));
             }
         }
 
@@ -177,7 +177,7 @@ impl CodesearchService {
                 Ok(g) => g,
                 Err(e) => {
                     tracing::error!("MCP: Failed to get embedding service: {:?}", e);
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Error initializing embedding service: {e:#}"
                     ))]));
                 }
@@ -189,7 +189,7 @@ impl CodesearchService {
                 Ok(e) => e,
                 Err(e) => {
                     tracing::error!("MCP: Failed to embed query: {:?}", e);
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Error embedding query: {e:#}"
                     ))]));
                 }
@@ -227,7 +227,7 @@ impl CodesearchService {
                 // ("Error reading from project-routed vector store"), which
                 // hides the actual fault and makes remote diagnosis guesswork.
                 if mode == "semantic" {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Error searching vector store: {:#}",
                         e
                     ))]));
@@ -571,7 +571,7 @@ impl CodesearchService {
             let mut service_guard = match self.get_embedding_service() {
                 Ok(g) => g,
                 Err(e) => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Error initializing embedding service: {e:#}"
                     ))]));
                 }
@@ -580,7 +580,7 @@ impl CodesearchService {
             match service.embed_query(&request.query) {
                 Ok(e) => e,
                 Err(e) => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Error embedding query: {e:#}"
                     ))]));
                 }
@@ -625,7 +625,7 @@ impl CodesearchService {
                                 .map(|(alias, err)| format!("  - {alias}: {err}"))
                                 .collect::<Vec<_>>()
                                 .join("\n");
-                            return Ok(CallToolResult::success(vec![Content::text(format!(
+                            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                                 "Error searching vector store: {} of {} repo(s) in scope failed \
                              and none returned results:\n{}",
                                 o.failures.len(),
@@ -641,7 +641,7 @@ impl CodesearchService {
                 }
                 Err(e) => {
                     tracing::error!("MCP: vector fan-out failed: {:?}", e);
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Error searching vector store: {e:#}"
                     ))]));
                 }
@@ -978,7 +978,7 @@ impl CodesearchService {
                 warnings,
             };
             let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-            return Ok(CallToolResult::success(vec![Content::text(json)]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
         }
 
         // Pre-compute normalized project root for stripping absolute paths
@@ -1051,7 +1051,7 @@ impl CodesearchService {
         };
 
         let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     /// Resolve FTS results to SearchResult by looking up chunk metadata.

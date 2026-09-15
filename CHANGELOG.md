@@ -20,6 +20,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **Dependency refresh: h2, rustls, quinn-proto, zerovec-derive, moka.** A semver-safe `cargo update` lifts 126 packages within their existing requirements, clearing five open advisories without code changes: h2 0.4.15→0.4.19 (Aikido 41883526), rustls 0.23.42→0.23.45 (RUSTSEC-2026-0285), quinn-proto 0.11.16→0.11.18 (Aikido 41883527), zerovec-derive 0.11.3→0.11.6 (Aikido 41883531) and moka 0.12.15→0.12.16 (Aikido 41297220). fastembed/ort are deliberately kept at 5.17.3/rc.12 — 5.17.4 hard-requires the unstable ort rc.13 API break, which moves in its own PR.
 
+- **rmcp 1.8.0 → 3.3.0 — clears the five Aikido advisories on the MCP SDK (34247111).** Behavior-identical upgrade: the legacy `initialize` handshake and session semantics stay the default (`ProtocolVersion::LATEST` remains 2025-11-25); the 2026-07-28 stateless lifecycle is opt-in upstream and deliberately not enabled here. Code impact stayed small because the `#[tool_router]`/`#[tool_handler]` macros absorb the new MRTR response enums: `Content`/`RawContent` are now `ContentBlock`, the constructors-only impl takes `#[tool_router(allow_empty)]`, the stdio proxy's manual `call_tool` returns `CallToolResponse`, and content assertions drop the removed `.raw` projection.
+
 ## [1.3.19]
 
 ### Changed

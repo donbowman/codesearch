@@ -2,7 +2,7 @@ use super::helpers::prefix_path_with_alias;
 use crate::embed::ModelType;
 use crate::index::SharedStores;
 use crate::vectordb::VectorStore;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::ErrorData as McpError;
 use std::path::Path;
 use std::sync::Arc;
@@ -333,13 +333,13 @@ pub(crate) fn respond_with_items_noted<T: serde::Serialize>(
             message.push(' ');
             message.push_str(note);
         }
-        return Ok(CallToolResult::success(vec![Content::text(
+        return Ok(CallToolResult::success(vec![ContentBlock::text(
             qualify_empty_result(message, warnings),
         )]));
     }
     if note.is_none() && warnings.is_empty() {
         let json = serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string());
-        return Ok(CallToolResult::success(vec![Content::text(json)]));
+        return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
     }
     let mut payload = serde_json::Map::new();
     payload.insert("results".to_string(), serde_json::json!(items));
@@ -349,7 +349,7 @@ pub(crate) fn respond_with_items_noted<T: serde::Serialize>(
     if !warnings.is_empty() {
         payload.insert("warnings".to_string(), serde_json::json!(warnings));
     }
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::Value::Object(payload).to_string(),
     )]))
 }
@@ -385,12 +385,14 @@ pub(crate) fn respond_with_object<T: serde::Serialize>(
         if let Ok(mut v) = serde_json::to_value(value) {
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("warnings".to_string(), serde_json::json!(warnings));
-                return Ok(CallToolResult::success(vec![Content::text(v.to_string())]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(
+                    v.to_string(),
+                )]));
             }
         }
     }
     let json = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
-    Ok(CallToolResult::success(vec![Content::text(json)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
 }
 
 /// Build the `ambiguous_chunk_id` payload for `get_chunk`.
