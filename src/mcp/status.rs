@@ -6,7 +6,7 @@
 use super::*;
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content},
+    model::{CallToolResult, ContentBlock},
     tool, tool_router, ErrorData as McpError,
 };
 
@@ -25,7 +25,7 @@ impl CodesearchService {
         match kind.as_str() {
             "index" => self.index_status_impl(request.project, request.group).await,
             "projects" => self.list_projects().await,
-            _ => Ok(CallToolResult::success(vec![Content::text(format!(
+            _ => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Unknown status kind '{}'. Use `index` or `projects`.",
                 kind
             ))])),
@@ -92,14 +92,14 @@ impl CodesearchService {
                 };
 
                 let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
         }
 
         // Resolve project/group routing — status is scope-free, allow unscoped fan-out
         let ctx = match self.resolve_routing(&project, &group, true, "status").await {
             Ok(c) => c,
-            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+            Err(e) => return Ok(CallToolResult::success(vec![ContentBlock::text(e)])),
         };
 
         if ctx.needs_local_db {
@@ -121,7 +121,7 @@ impl CodesearchService {
                     mode: self.mcp_mode(),
                 };
                 let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
         }
 
@@ -211,7 +211,7 @@ impl CodesearchService {
                     mode: self.mcp_mode(),
                 };
                 let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
         };
 
@@ -244,7 +244,7 @@ impl CodesearchService {
         };
 
         let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     /// List all registered projects and groups. Called by `status(kind="projects")`.
@@ -426,6 +426,6 @@ impl CodesearchService {
         };
 
         let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 }

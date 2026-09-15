@@ -41,7 +41,7 @@ use regex::Regex;
 use rmcp::{
     handler::server::router::tool::ToolRouter,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
     tool_handler, tool_router, ErrorData as McpError, ServerHandler,
 };
 use std::collections::HashSet;
@@ -828,7 +828,7 @@ pub(crate) fn allow_vector_store_second_open(has_shared_stores: bool) -> bool {
 
 // === Tool Router Implementation ===
 
-#[tool_router]
+#[tool_router(allow_empty)] // ctors only; real tools merge in via merged_tool_router()
 impl CodesearchService {
     /// Create a new CodesearchService (standalone mode - opens its own VectorStore)
     #[allow(dead_code)] // Reserved for standalone MCP server mode
@@ -1494,7 +1494,7 @@ impl CodesearchService {
                     self.literal_search(Parameters(req)).await?
                 }
                 _ => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Unknown search mode '{}'. Use `semantic` or `literal`.",
                         mode
                     ))]));
@@ -1666,7 +1666,7 @@ impl CodesearchService {
         let (peer_name, remote_alias, chunk_id) = match parse_federated_chunk_ref(chunk_ref) {
             Some(parts) => parts,
             None => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
+                return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "Invalid chunk_ref '{}': expected '<peer>/<alias>:<chunk_id>'.",
                     chunk_ref
                 ))]));
@@ -1677,7 +1677,7 @@ impl CodesearchService {
             Some(p) => p.clone(),
             None => {
                 let known: Vec<String> = cfg.remotes.keys().cloned().collect();
-                return Ok(CallToolResult::success(vec![Content::text(format!(
+                return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "Unknown remote peer '{}' in chunk_ref '{}'. Known remotes: {}",
                     peer_name,
                     chunk_ref,
@@ -1688,7 +1688,7 @@ impl CodesearchService {
         let client = match FederationClient::new() {
             Ok(c) => c,
             Err(e) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
+                return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "federation disabled (http client error): {e}"
                 ))]));
             }
@@ -1703,11 +1703,11 @@ impl CodesearchService {
             .get_chunk(&peer, remote_alias, chunk_id, context_lines)
             .await
         {
-            Outcome::Ok(value) => Ok(CallToolResult::success(vec![Content::text(
+            Outcome::Ok(value) => Ok(CallToolResult::success(vec![ContentBlock::text(
                 value.to_string(),
             )])),
             Outcome::Unreachable(reason) => {
-                Ok(CallToolResult::success(vec![Content::text(format!(
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "Could not fetch chunk from remote peer '{}': {}",
                     peer_name, reason
                 ))]))
@@ -1739,7 +1739,7 @@ impl CodesearchService {
             },
         };
         let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-        CallToolResult::success(vec![Content::text(json)])
+        CallToolResult::success(vec![ContentBlock::text(json)])
     }
 }
 
@@ -1861,7 +1861,7 @@ type RestError = (StatusCode, AxumJson<serde_json::Value>);
 
 /// Unwrap a `CallToolResult` into the JSON a federation client wants.
 ///
-/// `CallToolResult` carries its payload as `Content::text(json_string)`. The
+/// `CallToolResult` carries its payload as `ContentBlock::text(json_string)`. The
 /// normal case for search/find/explore/get_chunk is a single text item whose
 /// value parses as JSON, so we parse it back and return the structured value
 /// (clients get clean objects instead of a JSON-in-string). When the tool set

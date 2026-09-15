@@ -20,11 +20,15 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **Dependency refresh: h2, rustls, quinn-proto, zerovec-derive, moka.** A semver-safe `cargo update` lifts 126 packages within their existing requirements, clearing five open advisories without code changes: h2 0.4.15→0.4.19 (Aikido 41883526), rustls 0.23.42→0.23.45 (RUSTSEC-2026-0285), quinn-proto 0.11.16→0.11.18 (Aikido 41883527), zerovec-derive 0.11.3→0.11.6 (Aikido 41883531) and moka 0.12.15→0.12.16 (Aikido 41297220). fastembed/ort are deliberately kept at 5.17.3/rc.12 — 5.17.4 hard-requires the unstable ort rc.13 API break, which moves in its own PR.
 
+<<<<<<< HEAD
+- **rmcp 1.8.0 → 3.3.0 — clears the five Aikido advisories on the MCP SDK (34247111).** Behavior-identical upgrade: the legacy `initialize` handshake and session semantics stay the default (`ProtocolVersion::LATEST` remains 2025-11-25); the 2026-07-28 stateless lifecycle is opt-in upstream and deliberately not enabled here. Code impact stayed small because the `#[tool_router]`/`#[tool_handler]` macros absorb the new MRTR response enums: `Content`/`RawContent` are now `ContentBlock`, the constructors-only impl takes `#[tool_router(allow_empty)]`, the stdio proxy's manual `call_tool` returns `CallToolResponse`, and content assertions drop the removed `.raw` projection.
+=======
 ### Changed
 
 - **ort rc.13 + fastembed 5.17.4 (ONNX runtime refresh).** fastembed 5.17.4 hard-requires ort 2.0.0-rc.13, so both move together. rc.13 renamed the CPU execution provider (`CPUExecutionProvider` → `ort::ep::CPU`); the embedder's import and construction follow, builder chain unchanged (arena allocator still on). Scope note: ort-sys rc.13 still pins `lzma-rust2 ^0.15`, so the lzma-rust2 0.16.5 advisory (Aikido 37515813) remains open until upstream bumps its build dependency.
 
 - **Vector-index stack aligned on rand 0.10: arroy 0.5→0.8, heed 0.20→0.22.** The direct `rand` requirement moves to 0.10.2 — the major rmcp already uses — instead of pinning three rand majors side by side in the lock. arroy 0.8 and heed 0.22 follow because arroy 0.8 hard-requires both (`rand ^0.10.2`, `heed ^0.22.1`); no call-site changes were needed beyond silencing heed's `EnvFlags::NO_TLS` deprecation (same LMDB `MDB_NOTLS` flag, same behavior — the type-state `Env<WithoutTls>` migration is deferred). heed-types 0.21, roaring 0.11 and ordered-float 5 ride along transitively. Note: the rand 0.9.5 Aikido flagged rides the fastembed→hf-hub/tokenizers chain and clears with the fastembed 6 major, not with this change.
+>>>>>>> origin/develop
 
 ## [1.3.19]
 

@@ -2236,10 +2236,10 @@ fn qualify_empty_result_contradicts_a_not_found_diagnosis() {
 
 #[test]
 fn respond_with_items_carries_warnings_on_every_path() {
-    use rmcp::model::RawContent;
+    use rmcp::model::ContentBlock;
     let text = |r: Result<super::CallToolResult, super::McpError>| -> String {
-        match &r.unwrap().content[0].raw {
-            RawContent::Text(t) => t.text.clone(),
+        match &r.unwrap().content[0] {
+            ContentBlock::Text(t) => t.text.clone(),
             other => panic!("expected text content, got {other:?}"),
         }
     };
@@ -2276,10 +2276,10 @@ fn respond_with_items_carries_warnings_on_every_path() {
 
 #[test]
 fn respond_with_items_noted_shapes_on_every_path() {
-    use rmcp::model::RawContent;
+    use rmcp::model::ContentBlock;
     let text = |r: Result<super::CallToolResult, super::McpError>| -> String {
-        match &r.unwrap().content[0].raw {
-            RawContent::Text(t) => t.text.clone(),
+        match &r.unwrap().content[0] {
+            ContentBlock::Text(t) => t.text.clone(),
             other => panic!("expected text content, got {other:?}"),
         }
     };
@@ -2427,10 +2427,10 @@ fn ambiguous_chunk_payload_is_unchanged_when_every_store_answered() {
 
 #[test]
 fn respond_with_object_carries_warnings_without_disturbing_the_healthy_shape() {
-    use rmcp::model::RawContent;
+    use rmcp::model::ContentBlock;
     let text = |r: Result<super::CallToolResult, super::McpError>| -> String {
-        match &r.unwrap().content[0].raw {
-            RawContent::Text(t) => t.text.clone(),
+        match &r.unwrap().content[0] {
+            ContentBlock::Text(t) => t.text.clone(),
             other => panic!("expected text content, got {other:?}"),
         }
     };
