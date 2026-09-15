@@ -1962,8 +1962,8 @@ const SERVE_HEALTH_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_
 /// makes. This is required:
 /// - when serve is bound to a non-localhost address (the `require_auth_for_network`
 ///   middleware guards ALL endpoints, including `/health`), and
-/// - for management endpoints (`POST /repos`, `DELETE /repos/:alias`,
-///   `POST /repos/:alias/reindex`, `POST /reload`) when serve is bound to
+/// - for management endpoints (`POST /repos`, `DELETE /repos/{alias}`,
+///   `POST /repos/{alias}/reindex`, `POST /reload`) when serve is bound to
 ///   localhost with the key set.
 ///
 /// Without this, delegation to a network-bound serve returns 401 and falls back
@@ -2386,7 +2386,7 @@ pub(crate) async fn try_delegate_add_to_serve(
 }
 
 /// The outcome a running serve instance reported for a delegated `index rm`
-/// — the parsed `DELETE /repos/:alias` success payload.
+/// — the parsed `DELETE /repos/{alias}` success payload.
 ///
 /// `db_deleted == false` means the repo is functionally removed (FSW stopped,
 /// evicted from memory, unregistered from repos.json) but the database
@@ -2472,7 +2472,7 @@ pub(crate) async fn try_delegate_rm_to_serve(
         .map(|(a, _)| a.clone())
         .ok_or_else(|| format!("path '{}' not found in repos.json", project_path.display()))?;
 
-    // 3. DELETE /repos/:alias
+    // 3. DELETE /repos/{alias}
     //
     // The DELETE needs its OWN client with a timeout that covers serve's
     // legitimate worst-case removal time: `remove_repo` can spend up to
@@ -3154,7 +3154,7 @@ mod remove_order_tests {
                 }),
             )
             .route(
-                "/repos/:alias",
+                "/repos/{alias}",
                 axum::routing::delete(
                     |axum::extract::Path(alias): axum::extract::Path<String>| async move {
                         axum::Json(serde_json::json!({
@@ -3232,7 +3232,7 @@ mod remove_order_tests {
                 }),
             )
             .route(
-                "/repos/:alias",
+                "/repos/{alias}",
                 axum::routing::delete(
                     |axum::extract::Path(alias): axum::extract::Path<String>| async move {
                         tokio::time::sleep(std::time::Duration::from_secs(4)).await;

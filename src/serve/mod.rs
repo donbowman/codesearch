@@ -3,8 +3,8 @@
 //! Binds on `{host}:{port}` (default `127.0.0.1:39725`) and serves:
 //! - `GET /health` → JSON health check
 //! - `POST /repos` → register + index + warmup a new repo
-//! - `DELETE /repos/:alias` → stop FSW + evict + unregister + delete DB
-//! - `POST /repos/:alias/reindex` → trigger incremental or force reindex
+//! - `DELETE /repos/{alias}` → stop FSW + evict + unregister + delete DB
+//! - `POST /repos/{alias}/reindex` → trigger incremental or force reindex
 //! - MCP streamable HTTP at `/mcp` via rmcp tower service
 //!
 //! Holds a `DashMap<String, Arc<SharedStores>>` keyed by repo alias.
@@ -1372,7 +1372,7 @@ impl ServeState {
 
     /// Remove a repo: stop FSW, evict from memory, unregister from config, delete DB.
     ///
-    /// This is the shared logic used by both the HTTP `DELETE /repos/:alias` handler
+    /// This is the shared logic used by both the HTTP `DELETE /repos/{alias}` handler
     /// and the TUI confirmation flow.
     pub(crate) async fn remove_repo(&self, alias: &str) -> Result<RepoRemovalOutcome> {
         // 1. Resolve project path from config
@@ -4319,7 +4319,7 @@ pub(crate) struct RepoRemovalOutcome {
     pub db_delete_error: Option<String>,
 }
 
-/// Remove-repo handler: DELETE /repos/:alias
+/// Remove-repo handler: DELETE /repos/{alias}
 ///
 /// Stops the FSW, evicts the repo from memory, unregisters from repos.json,
 /// and deletes the database directory. Returns 200 on success (status is
@@ -4500,8 +4500,8 @@ fn request_has_valid_api_key(headers: &axum::http::HeaderMap, configured: &str) 
 ///
 /// When the env var is unset or empty, all requests pass through (backward compatible).
 ///
-/// Management endpoints are: `POST /repos`, `DELETE /repos/:alias`,
-/// `POST /repos/:alias/reindex`, `POST /reload`.
+/// Management endpoints are: `POST /repos`, `DELETE /repos/{alias}`,
+/// `POST /repos/{alias}/reindex`, `POST /reload`.
 /// All other routes (health, status, MCP) are always unauthenticated.
 ///
 /// Key comparison is constant-time (see `api_key_matches`).
@@ -5136,24 +5136,24 @@ pub async fn run_serve(
         // /remotes is a status-like read-only observability endpoint (lists the
         // configured federation peers). It is NOT in require_admin_auth's
         // `is_management` set, so it inherits exactly the same auth policy as
-        // /status, /repos/:alias/info and /repos/:alias/doctor: reachable
+        // /status, /repos/{alias}/info and /repos/{alias}/doctor: reachable
         // without the admin key on localhost, protected by
         // require_auth_for_network on network binds. See REMOTES_PATH doc.
         .route(REMOTES_PATH, axum::routing::get(remotes_handler))
         .route("/repos", axum::routing::post(add_repo_handler))
-        .route("/repos/:alias", axum::routing::delete(remove_repo_handler))
+        .route("/repos/{alias}", axum::routing::delete(remove_repo_handler))
         .route("/reload", axum::routing::post(reload_handler))
         .route(
-            "/repos/:alias/reindex",
+            "/repos/{alias}/reindex",
             axum::routing::post(reindex_handler),
         )
-        .route("/repos/:alias/info", axum::routing::get(info_handler))
+        .route("/repos/{alias}/info", axum::routing::get(info_handler))
         // /doctor is a POST but is intentionally read-only (diagnostics only, no
         // --fix path), so like /info and /status it is NOT in require_admin_auth's
         // management set — reachable without the admin key on localhost, and still
         // protected by require_auth_for_network on network binds. If doctor ever
         // gains a mutating mode, add it to `is_management` in require_admin_auth.
-        .route("/repos/:alias/doctor", axum::routing::post(doctor_handler))
+        .route("/repos/{alias}/doctor", axum::routing::post(doctor_handler))
         // REST endpoints — federation-friendly HTTP+JSON mirror of the read-only
         // MCP tools (search/find/explore/get_chunk). Lets a remote codesearch
         // serve be queried WITHOUT an MCP session. Same auth layers as /mcp &
