@@ -272,5 +272,18 @@ upstream branch or in a PR to `upstream` (`flupkede/codesearch`).
   (never from `integration`) so the PR contains only that fix.
 - **After acceptance:** `git fetch upstream` and merge the accepted work
   downward into `integration`.
+- **Changelog check:** every PR into `develop` must add an entry under the
+  pending-version heading in `CHANGELOG.md` (see the convention comment at the
+  top of that file), or carry the `no-changelog` label for tests/docs/CI-only
+  churn. Add the label via REST, not `gh pr edit --add-label` (that fails on
+  this repo with a Projects-classic GraphQL error):
+  `gh api --method POST repos/flupkede/codesearch/issues/<n>/labels -f "labels[]=no-changelog"`.
+- **Upstream CI is push-triggered, not PR-triggered.** `ci.yml` runs on pushes
+  to `develop`, `master`, `feature/**`, `features/**`, `fix/**`, `chore/**`
+  (other prefixes silently get no CI). Pushes to our fork run CI in the fork,
+  and those checks do NOT appear on the upstream PR; only runs in the upstream
+  repo do. Our local pre-push QC gate mirrors CI, so it is the effective
+  pre-PR gate. To get PR-visible CI, the branch must be mirrored to the
+  upstream repo (we have push access there).
 - Anything fork-only (this section, local notes, local build tweaks) stays on
   `integration`; upstream PR branches must stay clean of it.
