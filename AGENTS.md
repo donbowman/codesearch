@@ -275,8 +275,8 @@ upstream branch or in a PR to `upstream` (`flupkede/codesearch`).
 - **Changelog check:** every PR into `develop` must add an entry under the
   pending-version heading in `CHANGELOG.md` (see the convention comment at the
   top of that file), or carry the `no-changelog` label for tests/docs/CI-only
-  churn. Add the label via REST, not `gh pr edit --add-label` (that fails on
-  this repo with a Projects-classic GraphQL error):
+  churn. Add the label with `gh pr edit <n> --add-label no-changelog` (gh
+  >= 2.102); older gh needs the REST fallback:
   `gh api --method POST repos/flupkede/codesearch/issues/<n>/labels -f "labels[]=no-changelog"`.
 - **Upstream CI is push-triggered, not PR-triggered.** `ci.yml` runs on pushes
   to `develop`, `master`, `feature/**`, `features/**`, `fix/**`, `chore/**`
