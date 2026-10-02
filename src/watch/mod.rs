@@ -633,6 +633,8 @@ impl GitHeadWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::EnvRestore;
+    use serial_test::serial;
     use std::fs;
     use std::process::Command;
     use tempfile::tempdir;
@@ -672,9 +674,21 @@ mod tests {
         Ok(())
     }
 
+    /// Build a `FileWatcher` with the home directory pointed at an empty
+    /// temporary directory, so the developer's real
+    /// `~/.codesearch/.codesearchignore` cannot leak into the assertions.
+    /// CI has no such file, which is why the ambient dependency went unnoticed.
+    fn watcher_with_isolated_home(root: PathBuf) -> FileWatcher {
+        let home = tempdir().unwrap();
+        let home = home.path().to_string_lossy().into_owned();
+        let _guard = EnvRestore::set(&[("HOME", &home), ("USERPROFILE", &home)]);
+        FileWatcher::new(root)
+    }
+
     #[test]
+    #[serial]
     fn test_is_watchable() {
-        let watcher = FileWatcher::new(PathBuf::from("/tmp"));
+        let watcher = watcher_with_isolated_home(PathBuf::from("/tmp"));
 
         // Should NOT watch (ignored dirs)
         assert!(!watcher.is_watchable(Path::new("/tmp/.git/config")));
@@ -706,6 +720,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_gitignore_rules_respected() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -717,7 +732,7 @@ mod tests {
         )
         .unwrap();
 
-        let watcher = FileWatcher::new(root.to_path_buf());
+        let watcher = watcher_with_isolated_home(root.to_path_buf());
         assert!(watcher.gitignore.is_some(), "Should have loaded .gitignore");
 
         // Should NOT watch (gitignored patterns)
@@ -751,9 +766,10 @@ mod tests {
 
     #[test]
     #[ignore] // Requires actual filesystem events
+    #[serial]
     fn test_file_watcher() {
         let dir = tempdir().unwrap();
-        let mut watcher = FileWatcher::new(dir.path().to_path_buf());
+        let mut watcher = watcher_with_isolated_home(dir.path().to_path_buf());
 
         watcher.start(100).unwrap();
 
@@ -769,6 +785,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_codesearchignore_loaded_and_respected() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -776,7 +793,7 @@ mod tests {
         // Create repo-local .codesearchignore excluding tests/
         fs::write(root.join(".codesearchignore"), "tests/\n").unwrap();
 
-        let watcher = FileWatcher::new(root.to_path_buf());
+        let watcher = watcher_with_isolated_home(root.to_path_buf());
         assert!(
             watcher.gitignore.is_some(),
             "Should have loaded .codesearchignore"
@@ -793,6 +810,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_codesearchignore_overrides_gitignore() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -802,7 +820,7 @@ mod tests {
         fs::write(root.join(".gitignore"), "logs/\n").unwrap();
         fs::write(root.join(".codesearchignore"), "src/generated/\n").unwrap();
 
-        let watcher = FileWatcher::new(root.to_path_buf());
+        let watcher = watcher_with_isolated_home(root.to_path_buf());
         assert!(watcher.gitignore.is_some());
 
         // .gitignore pattern takes effect
@@ -823,11 +841,12 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_no_ignore_files_returns_none() {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let watcher = FileWatcher::new(root.to_path_buf());
+        let watcher = watcher_with_isolated_home(root.to_path_buf());
         assert!(
             watcher.gitignore.is_none(),
             "Should have no gitignore matcher when no ignore files exist"
