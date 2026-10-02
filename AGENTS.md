@@ -255,22 +255,22 @@ Older entries: see `CHANGELOG.md`.
 ## ⚠️ Fork-only: Don's integration workflow — never send upstream
 
 This section is local to Don's fork (`origin` = `donbowman/codesearch`). It is
-committed only on the `latest` integration branch and must never appear on an
+committed only on the `integration` branch and must never appear on an
 upstream branch or in a PR to `upstream` (`flupkede/codesearch`).
 
-- **Never touch upstream `master`/`main`.** Here `master` is release-only and
-  `develop` is the upstream integration line. Upstream PRs target `develop`
-  (`gh pr create --base develop`); never push to any `upstream` branch.
-- **`latest` is the integration branch** — upstream code plus local work,
-  used to develop and dogfood changes. It is never sent upstream; do not open
-  PRs from `latest`.
+- **Never commit to `master` anywhere** — not upstream, not in the fork.
+  Upstream `master` is release-only; `develop` is the upstream integration
+  line. Upstream PRs target `develop` (`gh pr create --base develop`).
+- **`integration` is the fork's integration branch** — upstream code plus
+  local work, used to develop and dogfood changes. It is never sent upstream;
+  do not open PRs from `integration`.
 - **Keep it current:** periodically `git fetch upstream`, then merge
-  `upstream/develop` into `latest`.
-- **Local changes:** cut a branch off `latest`, develop there, then merge it
-  back into `latest`.
+  `upstream/develop` into `integration`.
+- **Local changes:** cut a branch off `integration`, develop there, then merge
+  it back into `integration`.
 - **Upstreaming:** cut a small, standalone branch from `upstream/develop`
-  (never from `latest`) so the PR contains only that fix.
+  (never from `integration`) so the PR contains only that fix.
 - **After acceptance:** `git fetch upstream` and merge the accepted work
-  downward into `latest`.
+  downward into `integration`.
 - Anything fork-only (this section, local notes, local build tweaks) stays on
-  `latest`; upstream PR branches must stay clean of it.
+  `integration`; upstream PR branches must stay clean of it.
