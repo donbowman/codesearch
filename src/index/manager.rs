@@ -200,9 +200,32 @@ pub struct SharedStores {
     /// Counter for number of file changes processed (indexed + removed) since serve start.
     /// Incremented by FSW batches and incremental refreshes. Read by TUI/dashboard.
     pub changes_count: std::sync::atomic::AtomicU64,
+    /// Process-wide heavy-job gate. `Some` in serve mode (attached by
+    /// `ServeState::try_open_stores`), `None` in standalone CLI/MCP processes.
+    /// Every whole-repo refresh/reindex/build takes one permit from it; see
+    /// [`crate::limits`].
+    pub job_gate: Option<Arc<crate::limits::JobGate>>,
 }
 
 impl SharedStores {
+    /// Attach a process-wide heavy-job gate to these stores (serve mode).
+    pub fn with_job_gate(mut self, gate: Arc<crate::limits::JobGate>) -> Self {
+        self.job_gate = Some(gate);
+        self
+    }
+
+    /// Acquire one heavy-job permit, or `None` when no gate is attached
+    /// (standalone processes keep their previous unbounded behaviour).
+    ///
+    /// Hold the returned permit for the whole job: that is what bounds how
+    /// many repos chunk/embed/build at once. Queries never take this permit.
+    pub async fn acquire_job_permit(&self) -> Option<crate::limits::JobPermit> {
+        match self.job_gate.as_ref() {
+            Some(gate) => Some(gate.acquire().await),
+            None => None,
+        }
+    }
+
     /// Create new shared stores from the database path (read-write mode).
     ///
     /// This acquires a writer lock. If another process already has the lock,
@@ -238,6 +261,7 @@ impl SharedStores {
             writer_lock: lock,
             readonly: false,
             changes_count: std::sync::atomic::AtomicU64::new(0),
+            job_gate: None,
         })
     }
 
@@ -257,6 +281,7 @@ impl SharedStores {
             writer_lock: None,
             readonly: true,
             changes_count: std::sync::atomic::AtomicU64::new(0),
+            job_gate: None,
         })
     }
 
@@ -337,6 +362,18 @@ fn embed_service_choice(pool: Option<&Arc<EmbeddingServicePool>>) -> EmbeddingSo
         Some(p) => EmbeddingSource::Pool(Arc::clone(p)),
         None => EmbeddingSource::Fresh,
     }
+}
+
+/// True when the current refresh batch should stop accumulating files before
+/// reading the next one.
+///
+/// `consumed > 0` guarantees at least one file per batch, so a single file
+/// larger than `max_chunks` still makes progress; `max_chunks == 0` disables
+/// the cap entirely (the file-count batch size remains the only bound).
+/// Extracted as a pure predicate so its edges are unit-testable without
+/// loading ONNX.
+fn chunk_cap_reached(consumed: usize, accumulated_chunks: usize, max_chunks: usize) -> bool {
+    consumed > 0 && max_chunks > 0 && accumulated_chunks >= max_chunks
 }
 
 impl IndexManager {
@@ -601,6 +638,36 @@ impl IndexManager {
         embedding_pool: Option<&Arc<EmbeddingServicePool>>,
         heartbeat: Option<&IndexingHeartbeat>,
     ) -> Result<()> {
+        // Serialise this whole refresh behind the process-wide heavy-job gate
+        // (when one is attached): the permit is held across the file walk, the
+        // chunk/embed batches and the final HNSW build, so at most
+        // `CODESEARCH_INDEX_JOBS` repos do this at once. Queries never take it.
+        let _job_permit = stores.acquire_job_permit().await;
+        Self::perform_incremental_refresh_inner(
+            codebase_path,
+            db_path,
+            stores,
+            cancel_token,
+            embedding_pool,
+            heartbeat,
+        )
+        .await
+    }
+
+    /// Gate-free body of [`Self::perform_incremental_refresh_with_stores`].
+    ///
+    /// Split out for `force_reindex_with_stores`, which holds the gate permit
+    /// across the destructive clear phase as well and must call this directly:
+    /// re-entering the public wrapper would re-acquire the gate and deadlock
+    /// under `CODESEARCH_INDEX_JOBS=1`.
+    async fn perform_incremental_refresh_inner(
+        codebase_path: &Path,
+        db_path: &Path,
+        stores: &SharedStores,
+        cancel_token: &CancellationToken,
+        embedding_pool: Option<&Arc<EmbeddingServicePool>>,
+        heartbeat: Option<&IndexingHeartbeat>,
+    ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use crate::chunker::SemanticChunker;
         use crate::embed::EmbeddingService;
@@ -799,24 +866,43 @@ impl IndexManager {
         // sync. Batching bounds peak memory to O(batch), not O(total delta),
         // so a delta of any size is now safe — it just takes longer, spread
         // across sequential batches. See `INCREMENTAL_REFRESH_BATCH_SIZE`.
+        //
+        // A batch is additionally cut short once its accumulated chunks reach
+        // `CODESEARCH_MAX_CHUNKS_PER_BATCH` (when set): file count alone is a
+        // poor memory proxy when a few files can produce tens of thousands of
+        // chunks.
         if !changed_files.is_empty() {
             let batch_size = std::env::var(crate::constants::INCREMENTAL_REFRESH_BATCH_SIZE_ENV)
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .filter(|&n| n > 0)
                 .unwrap_or(crate::constants::INCREMENTAL_REFRESH_BATCH_SIZE);
-            let total_batches = changed_files.len().div_ceil(batch_size);
+            let max_chunks = crate::limits::max_chunks_per_batch();
+            let embed_pause = crate::limits::embed_pause();
+            // Upper-bound estimate for the log line; the chunk cap can split
+            // this into more batches than the file count alone implies.
+            let estimated_batches = changed_files.len().div_ceil(batch_size);
             info!(
-                "🔄 Processing {} changed files in {} batch(es) of up to {} file(s) each...",
+                "🔄 Processing {} changed files in ~{} batch(es) of up to {} file(s) each \
+                 (chunk cap per batch: {})...",
                 changed_files.len(),
-                total_batches,
-                batch_size
+                estimated_batches,
+                batch_size,
+                if max_chunks == 0 {
+                    "none".to_string()
+                } else {
+                    max_chunks.to_string()
+                }
             );
 
             let cache_dir = crate::constants::get_global_models_cache_dir()?;
             let mut total_indexed = 0usize;
+            let mut cursor = 0usize;
+            let mut batch_idx = 0usize;
 
-            for (batch_idx, file_batch) in changed_files.chunks(batch_size).enumerate() {
+            while cursor < changed_files.len() {
+                let take = (changed_files.len() - cursor).min(batch_size);
+                let files_for_embed = changed_files[cursor..cursor + take].to_vec();
                 // Abort between batches if the repo was removed mid-index.
                 Self::ensure_indexing_active(cancel_token)?;
                 // A batch of a large delta can run for minutes — renew the
@@ -832,7 +918,11 @@ impl IndexManager {
                 // so it never runs on a tokio worker thread. The `EmbeddingService`
                 // and `SemanticChunker` are built inside the closure because they
                 // are not needed on the async side and may not be `Send`.
-                let files_for_embed = file_batch.to_vec();
+                //
+                // The closure consumes as many of the offered files as fit the
+                // chunk cap (always at least one, so every iteration makes
+                // progress) and reports how many it took, so the outer loop's
+                // bookkeeping covers exactly the files that were processed.
                 let cache_dir_for_batch = cache_dir.clone();
                 let root_for_batch = codebase_path.to_path_buf();
                 // Clone the token into the blocking closure so a cancel arriving
@@ -840,18 +930,30 @@ impl IndexManager {
                 // per-file, not only once the whole batch returns.
                 let batch_cancel = cancel_token.clone();
                 let embed_source = embed_service_choice(embedding_pool);
-                let embedded_chunks = tokio::task::spawn_blocking(
-                    move || -> Result<Vec<crate::embed::EmbeddedChunk>> {
+                let (embedded_chunks, consumed) = tokio::task::spawn_blocking(
+                    move || -> Result<(Vec<crate::embed::EmbeddedChunk>, usize)> {
                         let mut chunker = SemanticChunker::new(100, 2000, 10);
                         let mut all_chunks = Vec::new();
+                        let mut consumed = 0usize;
 
                         for file in &files_for_embed {
+                            // Stop once this batch has reached its chunk budget.
+                            // `consumed > 0` guarantees at least one file per
+                            // iteration even if that one file alone exceeds the
+                            // cap, so the outer loop always advances.
+                            if chunk_cap_reached(consumed, all_chunks.len(), max_chunks) {
+                                break;
+                            }
                             // Mid-embed cancellation point: abort inside the
                             // spawn_blocking task so we stop reading/chunking/
                             // embedding further files in this batch promptly.
                             if batch_cancel.is_cancelled() {
                                 return Err(anyhow::anyhow!("indexing cancelled"));
                             }
+                            // Count the file before the read: a read failure
+                            // still advances the outer cursor, so the loop can
+                            // never stall on an unreadable file.
+                            consumed += 1;
                             let content = match std::fs::read_to_string(&file.path) {
                                 Ok(c) => c,
                                 Err(_) => continue,
@@ -867,53 +969,45 @@ impl IndexManager {
                         }
 
                         if all_chunks.is_empty() {
-                            return Ok(Vec::new());
+                            return Ok((Vec::new(), consumed));
                         }
 
-                        // NOTE: embed_chunks runs a single ONNX inference over
-                        // the whole batch atomically, so it is not interruptible
-                        // mid-call. Worst-case cancel latency is bounded to one
-                        // batch's embed (INCREMENTAL_REFRESH_BATCH_SIZE=200
-                        // files); the per-file check above bounds the read/chunk
-                        // phase that precedes it.
-                        match embed_source {
-                            // Serve process: the pool already holds the
-                            // persistent cache's LMDB env open — a fresh
-                            // EmbeddingService here is refused by the
-                            // process-global registry and would re-embed
-                            // everything without cache.
+                        // Serve process: the pool already holds the persistent
+                        // cache's LMDB env open — a fresh `EmbeddingService`
+                        // here is refused by the process-global registry and
+                        // would re-embed everything without cache.
+                        //
+                        // `embed_chunks_yielding` holds the per-model lock for
+                        // one ONNX mini-batch at a time (plus the configured
+                        // pause), so an interactive query embedding is not stuck
+                        // behind this whole file batch.
+                        let embedded = match embed_source {
                             EmbeddingSource::Pool(pool) => {
-                                let service = pool.get(embed_model)?;
-                                // Recover from poisoning: a panicked embed
-                                // service still yields a valid guard (the
-                                // batch's embed_chunks result is what carries
-                                // correctness); a poison here must not
-                                // hard-fail every later batch for the
-                                // process lifetime.
-                                let mut guard = service
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                guard.embed_chunks(all_chunks)
+                                pool.embed_chunks_yielding(embed_model, all_chunks, embed_pause)?
                             }
                             EmbeddingSource::Fresh => {
                                 let mut embedding_service = EmbeddingService::with_cache_dir(
                                     embed_model,
                                     Some(cache_dir_for_batch.as_path()),
                                 )?;
-                                embedding_service.embed_chunks(all_chunks)
+                                embedding_service.embed_chunks(all_chunks)?
                             }
-                        }
+                        };
+                        Ok((embedded, consumed))
                     },
                 )
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!(
-                        "chunk+embed task panicked (batch {}/{}): {}",
-                        batch_idx + 1,
-                        total_batches,
-                        e
-                    )
+                    anyhow::anyhow!("chunk+embed task panicked (batch {}): {}", batch_idx + 1, e)
                 })??;
+
+                // The closure always consumes at least one file; guard the
+                // cursor arithmetic against a future regression that would
+                // otherwise spin forever.
+                debug_assert!(consumed > 0, "refresh batch made no progress");
+                let file_batch = &changed_files[cursor..cursor + consumed];
+                cursor += consumed;
+                batch_idx += 1;
 
                 // A cancel arriving after embed completed but before we commit
                 // the batch to the stores must skip the insert + the final
@@ -922,9 +1016,8 @@ impl IndexManager {
 
                 if !embedded_chunks.is_empty() {
                     info!(
-                        "📦 Batch {}/{}: embedding {} chunks with model {}...",
-                        batch_idx + 1,
-                        total_batches,
+                        "📦 Batch {}: embedding {} chunks with model {}...",
+                        batch_idx,
                         embedded_chunks.len(),
                         embed_model.short_name()
                     );
@@ -1007,7 +1100,7 @@ impl IndexManager {
 
             info!(
                 "✅ Indexed {} chunks across {} batch(es)",
-                total_indexed, total_batches
+                total_indexed, batch_idx
             );
         }
 
@@ -1078,6 +1171,12 @@ impl IndexManager {
 
         // Bail before clearing any store data if the repo was already removed.
         Self::ensure_indexing_active(cancel_token)?;
+
+        // Hold the process-wide heavy-job gate across the destructive clear AND
+        // the full reindex. The nested call goes to the gate-free inner body so
+        // the permit is not re-acquired (which would deadlock under
+        // `CODESEARCH_INDEX_JOBS=1`).
+        let _job_permit = stores.acquire_job_permit().await;
 
         // ── Step 0: Read and preserve metadata BEFORE clearing anything ──
         // This is defensive: the DB may be incomplete (no metadata.json at all),
@@ -1187,7 +1286,7 @@ impl IndexManager {
         info!("✅ Stores cleared, metadata preserved. Starting full reindex...");
 
         // ── Step 5: Reindex — all files treated as "changed" since metadata is empty ──
-        Self::perform_incremental_refresh_with_stores(
+        Self::perform_incremental_refresh_inner(
             codebase_path,
             db_path,
             stores,
@@ -1970,6 +2069,11 @@ impl IndexManager {
         // Bail before touching any store if the repo was removed.
         Self::ensure_indexing_active(cancel_token)?;
 
+        // One permit for the whole watcher batch: a batch can hold hundreds of
+        // files, each re-embedded and followed by an HNSW rebuild, and every
+        // repo's watcher would otherwise run one at the same time.
+        let _job_permit = stores.acquire_job_permit().await;
+
         // Enable quiet mode during FSW batch processing to suppress verbose embedding output
         set_quiet(true);
 
@@ -2130,6 +2234,9 @@ impl IndexManager {
 
         // Abort before the filesystem walk if the repo was already removed.
         Self::ensure_indexing_active(cancel_token)?;
+
+        // One permit for the whole branch-refresh pass (walk, delete, re-index).
+        let _job_permit = stores.acquire_job_permit().await;
 
         let result: Result<()> = async {
             // Phase 1: Discover current files on disk.
@@ -2469,11 +2576,11 @@ impl IndexManager {
         // registry and would degrade this path to cache-less re-embedding.
         let embedded_chunks = match embed_service_choice(embedding_pool) {
             EmbeddingSource::Pool(pool) => {
-                let service = pool.get(embed_model)?;
-                let mut guard = service
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.embed_chunks(chunks)?
+                // The FSW paths hold a job permit (`process_batch_with_stores`
+                // / `refresh_index_with_stores`); interleave the model lock per
+                // mini-batch so a concurrent query embedding is not stuck
+                // behind this file.
+                pool.embed_chunks_yielding(embed_model, chunks, std::time::Duration::ZERO)?
             }
             EmbeddingSource::Fresh => {
                 let cache_dir = crate::constants::get_global_models_cache_dir()?;
@@ -2712,6 +2819,7 @@ mod tests {
             writer_lock: None,
             readonly: false,
             changes_count: std::sync::atomic::AtomicU64::new(0),
+            job_gate: None,
         }
     }
 
@@ -2751,6 +2859,132 @@ mod tests {
             "acquire_writer_lock should create the dir and acquire the lock"
         );
         assert!(db_path.join(WRITER_LOCK_FILE).exists());
+    }
+
+    /// The chunk-cap predicate is the batch-splitting decision; pin its edges
+    /// here because the loop that uses it runs inside `spawn_blocking` and
+    /// would otherwise need the ONNX embedding model.
+    #[test]
+    fn chunk_cap_predicate_table() {
+        let cases = [
+            // (consumed, accumulated_chunks, cap, expected)
+            (0, 10_000, 5_000, false), // first file of a batch always proceeds
+            (1, 4_999, 5_000, false),  // below the cap
+            (1, 5_000, 5_000, true),   // exactly at the cap
+            (1, 5_001, 5_000, true),   // one file overshot the cap
+            (7, 10_000, 0, false),     // cap disabled
+            (1, 0, 0, false),          // cap disabled, nothing accumulated
+        ];
+        for (consumed, accumulated, cap, expected) in cases {
+            assert_eq!(
+                chunk_cap_reached(consumed, accumulated, cap),
+                expected,
+                "chunk_cap_reached(consumed={consumed}, accumulated={accumulated}, cap={cap})"
+            );
+        }
+    }
+
+    /// Standalone CLI / `codesearch mcp` stores carry no gate and must keep
+    /// their previous (unbounded) behaviour.
+    #[tokio::test]
+    async fn acquire_job_permit_is_none_for_ungated_stores() {
+        let temp = tempdir().unwrap();
+        let stores = create_test_stores(&temp.path().join("db"), 4).await;
+        assert!(stores.acquire_job_permit().await.is_none());
+    }
+
+    /// A gated refresh must (a) wait while the only slot is held and (b)
+    /// release the slot when it finishes. The repo has NO changed files, so the
+    /// refresh completes without loading the ONNX model.
+    #[tokio::test]
+    async fn gated_refresh_waits_for_a_free_slot_and_releases_it() {
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+        create_metadata_json(&db_path, 4);
+
+        let gate = crate::limits::JobGate::with_config(1, 0);
+        let held = gate.acquire().await;
+        let stores = Arc::new(
+            create_test_stores(&db_path, 4)
+                .await
+                .with_job_gate(Arc::clone(&gate)),
+        );
+
+        let mut refresh = tokio::spawn({
+            let stores = Arc::clone(&stores);
+            let codebase_path = codebase_path.clone();
+            let db_path = db_path.clone();
+            async move {
+                IndexManager::perform_incremental_refresh_with_stores(
+                    &codebase_path,
+                    &db_path,
+                    &stores,
+                    &CancellationToken::new(),
+                    None,
+                    None,
+                )
+                .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut refresh)
+                .await
+                .is_err(),
+            "the refresh must wait while the only job slot is held"
+        );
+
+        drop(held);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), refresh)
+            .await
+            .expect("refresh must complete once the slot is free")
+            .expect("refresh task must not panic");
+        assert!(result.is_ok(), "refresh failed: {:?}", result.err());
+
+        // The permit was released: the gate can be acquired again immediately.
+        let _again = tokio::time::timeout(std::time::Duration::from_secs(1), gate.acquire())
+            .await
+            .expect("the refresh must release its job permit");
+    }
+
+    /// Regression for the wrapper/inner split: `force_reindex_with_stores`
+    /// holds the gate permit across the destructive clear and then calls the
+    /// gate-free inner body. Calling the public wrapper again would re-acquire
+    /// the only permit and hang forever under `CODESEARCH_INDEX_JOBS=1` (this
+    /// test times out instead of hanging only because of the explicit
+    /// `timeout`).
+    #[tokio::test]
+    async fn force_reindex_under_gate_does_not_reacquire_the_permit() {
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+        create_metadata_json(&db_path, 4);
+
+        let gate = crate::limits::JobGate::with_config(1, 0);
+        let stores = create_test_stores(&db_path, 4)
+            .await
+            .with_job_gate(Arc::clone(&gate));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            IndexManager::force_reindex_with_stores(
+                &codebase_path,
+                &db_path,
+                &stores,
+                None,
+                &CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("force reindex must not deadlock on its own job permit");
+
+        assert!(result.is_ok(), "force reindex failed: {:?}", result.err());
     }
 
     #[tokio::test]

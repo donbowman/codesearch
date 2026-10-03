@@ -460,6 +460,26 @@ pub enum Commands {
         #[arg(long)]
         idle_suspend_secs: Option<u64>,
 
+        /// Max concurrent repo indexing jobs (refresh / reindex / HNSW build)
+        /// this serve runs. Overrides CODESEARCH_INDEX_JOBS (default 1).
+        #[arg(long)]
+        index_jobs: Option<usize>,
+
+        /// ONNX intra-op threads per embedding session. Overrides
+        /// CODESEARCH_EMBED_THREADS (unset = ONNX default, all cores).
+        #[arg(long)]
+        embed_threads: Option<usize>,
+
+        /// Milliseconds to pause between background embedding mini-batches.
+        /// Overrides CODESEARCH_EMBED_PAUSE_MS (default 0).
+        #[arg(long)]
+        embed_pause_ms: Option<u64>,
+
+        /// Minimum free memory (MB) before a heavy indexing job may start.
+        /// Overrides CODESEARCH_MIN_FREE_MB (default 0 = disabled).
+        #[arg(long)]
+        min_free_mb: Option<u64>,
+
         /// For `tui` action: serve URL to connect to
         #[arg(long, default_value = DEFAULT_SERVE_URL)]
         url: String,
@@ -1234,6 +1254,10 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             no_tui,
             keep_warm_url,
             idle_suspend_secs,
+            index_jobs,
+            embed_threads,
+            embed_pause_ms,
+            min_free_mb,
             url,
             api_key,
         } => {
@@ -1257,6 +1281,24 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     // never overrides an existing index.
                     if let Some(mt) = model_type {
                         warn_if_heavier_model(mt);
+                    }
+                    // CLI overrides for the heavy-work limits. Serve is a single
+                    // long-lived process, so exporting the overrides here keeps a
+                    // single source of truth (the environment) for every
+                    // component that reads them (job gate, embedder, refresh
+                    // batching) without threading a config struct through each
+                    // constructor. Unset flags change nothing.
+                    if let Some(n) = index_jobs {
+                        std::env::set_var(crate::limits::INDEX_JOBS_ENV, n.to_string());
+                    }
+                    if let Some(n) = embed_threads {
+                        std::env::set_var(crate::limits::EMBED_THREADS_ENV, n.to_string());
+                    }
+                    if let Some(ms) = embed_pause_ms {
+                        std::env::set_var(crate::limits::EMBED_PAUSE_MS_ENV, ms.to_string());
+                    }
+                    if let Some(mb) = min_free_mb {
+                        std::env::set_var(crate::limits::MIN_FREE_MB_ENV, mb.to_string());
                     }
                     crate::serve::run_serve(
                         host,
@@ -2092,6 +2134,58 @@ mod tests {
             "re-running install must be a no-op once the block is present"
         );
         assert_eq!(after_second.matches(HOOK_BEGIN).count(), 1);
+    }
+
+    #[test]
+    fn test_serve_heavy_work_limit_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "codesearch",
+            "serve",
+            "--index-jobs",
+            "2",
+            "--embed-threads",
+            "4",
+            "--embed-pause-ms",
+            "25",
+            "--min-free-mb",
+            "4096",
+        ])
+        .expect("cli parse should succeed");
+        match cli.command {
+            Commands::Serve {
+                index_jobs,
+                embed_threads,
+                embed_pause_ms,
+                min_free_mb,
+                ..
+            } => {
+                assert_eq!(index_jobs, Some(2));
+                assert_eq!(embed_threads, Some(4));
+                assert_eq!(embed_pause_ms, Some(25));
+                assert_eq!(min_free_mb, Some(4096));
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_serve_heavy_work_limit_flags_default_to_none() {
+        let cli = Cli::try_parse_from(["codesearch", "serve"]).expect("cli parse should succeed");
+        match cli.command {
+            Commands::Serve {
+                index_jobs,
+                embed_threads,
+                embed_pause_ms,
+                min_free_mb,
+                ..
+            } => {
+                assert_eq!(index_jobs, None, "unset flags must leave env/defaults");
+                assert_eq!(embed_threads, None);
+                assert_eq!(embed_pause_ms, None);
+                assert_eq!(min_free_mb, None);
+            }
+            _ => panic!("expected Serve command"),
+        }
     }
 
     #[test]

@@ -578,9 +578,56 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `CODESEARCH_CACHE_MAX_MEMORY` | Embedding cache MB (default: 500) |
 | `CODESEARCH_MAX_LMDB_MAP_SIZE_MB` | Hard cap (MB) for LMDB auto-resize on `MDB_MAP_FULL`, applied to both the vector store and the persistent embedding cache (default: 16384 = 16GB; clamped to at least 1024). Raise this for very large corpora (millions of chunks) that legitimately exceed the default cap — see #189. |
 | `CODESEARCH_BATCH_SIZE` | Embedding batch size |
+| `CODESEARCH_INCREMENTAL_BATCH_SIZE` | Files read/chunked per incremental-refresh batch (default: 200) |
+| `CODESEARCH_INDEX_JOBS` | Max concurrent heavy repo jobs — refresh / reindex / HNSW build — in one serve process (default: 1; queries are never gated). See [Indexing limits](#indexing-limits) |
+| `CODESEARCH_EMBED_THREADS` | ONNX intra-op threads per embedding session (unset = ONNX default, all cores) |
+| `CODESEARCH_EMBED_PAUSE_MS` | Pause (ms) between background embedding mini-batches, a duty cycle for shared machines (default: 0) |
+| `CODESEARCH_MIN_FREE_MB` | Free-memory floor (MB) a heavy job waits for (max 30 s, then proceeds with a warning) before starting (default: 0 = disabled) |
+| `CODESEARCH_MAX_CHUNKS_PER_BATCH` | Hard cap on chunks held in memory per refresh batch; splits the batch early (default: 0 = disabled) |
 | `CODESEARCH_SCIP_CSHARP` | Override path to `scip-csharp` helper |
 | `CODESEARCH_EXTENSION_MAP` | Path to the extension→language map (default: `~/.codesearch/extensions.json`) — see [Extension map](#extension-map) |
 | `RUST_LOG` | Log level (e.g. `codesearch=debug`) |
+
+### Indexing limits
+
+A serve hub with many repos used to start one full refresh/reindex/HNSW-build
+pass per repo as soon as that repo had work. A mass `git pull`, a burst of
+first queries, or several `POST /repos/:alias/reindex` calls therefore ran
+many CPU-heavy passes at once, held many file/chunk windows in memory, and
+queued the (already serialised) ONNX inference behind all of them. These knobs
+bound that work; they are read at startup, so a shell or systemd unit can set
+them without editing anything:
+
+| Knob | Default | Effect |
+|------|---------|--------|
+| `CODESEARCH_INDEX_JOBS` | `1` | Max repos doing a refresh / reindex / HNSW build at once. Queries never take this slot. |
+| `CODESEARCH_EMBED_THREADS` | unset (all cores) | ONNX intra-op threads per embedding session. |
+| `CODESEARCH_INCREMENTAL_BATCH_SIZE` | `200` | Files read/chunked per refresh batch. |
+| `CODESEARCH_MAX_CHUNKS_PER_BATCH` | `0` (off) | Split a batch early once it reaches this many chunks (a few huge files can produce more memory than many small ones). |
+| `CODESEARCH_EMBED_PAUSE_MS` | `0` | Sleep this long between background embedding mini-batches (duty cycle). |
+| `CODESEARCH_MIN_FREE_MB` | `0` (off) | A job waits (bounded to 30 s, then proceeds with a warning) until this much memory is free. |
+
+`codesearch serve` also accepts `--index-jobs`, `--embed-threads`,
+`--embed-pause-ms` and `--min-free-mb`, which set the corresponding variable
+for that process (flags win over the environment). Standalone `codesearch
+index` and `codesearch mcp` runs have no job gate and keep their previous
+behaviour; the embedding and batching variables still apply to them.
+
+Example for a large shared machine (128 cores, ~30 repos, dozens of repos
+indexed at once are the failure mode):
+
+```ini
+# ~/.config/systemd/user/codesearch.service.d/limits.conf
+[Service]
+Environment=CODESEARCH_INDEX_JOBS=1
+Environment=CODESEARCH_EMBED_THREADS=8
+Environment=CODESEARCH_INCREMENTAL_BATCH_SIZE=100
+Environment=CODESEARCH_MAX_CHUNKS_PER_BATCH=5000
+Environment=CODESEARCH_EMBED_PAUSE_MS=25
+Environment=CODESEARCH_MIN_FREE_MB=4096
+# C# SCIP helpers are bounded separately; lower it for the same reason.
+Environment=CSHARP_SCIP_CONCURRENCY=1
+```
 
 ### `.codesearchignore`
 

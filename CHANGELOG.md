@@ -14,6 +14,16 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.4.12]
+
+### Added
+
+- **Settable indexing/refresh limits: `CODESEARCH_INDEX_JOBS`, `CODESEARCH_EMBED_THREADS`, `CODESEARCH_EMBED_PAUSE_MS`, `CODESEARCH_MIN_FREE_MB`, `CODESEARCH_MAX_CHUNKS_PER_BATCH` (serve flags `--index-jobs`, `--embed-threads`, `--embed-pause-ms`, `--min-free-mb`).** A multi-repo hub used to start one full refresh/reindex/HNSW-build pass per repo the moment that repo had work, so a mass `git pull`, a burst of first queries or several HTTP reindexes ran many CPU-heavy passes at once, held many file/chunk windows in memory, and queued the (already serialised) ONNX inference behind all of them. A process-wide job gate now bounds concurrent heavy repo jobs (default **1**; queries never take it), the ONNX session's intra-op thread count can be capped (`CODESEARCH_EMBED_THREADS`, previously always all cores), background embedding releases the model lock once per mini-batch with an optional duty-cycle pause so interactive query embeddings are not stuck behind a whole batch, the read/chunk window can be capped by chunks as well as files, and a job can wait for a free-memory floor before starting. See the README section "Indexing limits" for recommended values.
+
+### Changed
+
+- **`codesearch serve` runs heavy repo jobs one at a time by default (`CODESEARCH_INDEX_JOBS=1`).** Warmup, cold opens, file-watcher batches and reindexes now queue behind a running refresh instead of all running at once; raise the value deliberately on machines with cores and memory to spare. Standalone `codesearch index` / `codesearch mcp` runs are unchanged (no gate is attached). `CODESEARCH_EMBED_THREADS` unset keeps the previous ONNX default (all cores), so single-repo index throughput is unchanged unless the variable is set.
+
 ## [1.4.11]
 
 ### Changed

@@ -319,6 +319,12 @@ pub(crate) struct ServeState {
     /// with the model of the repo it targets. Mirrors the `symbol_registry`
     /// pattern.
     embedding_pool: Arc<crate::embed::EmbeddingServicePool>,
+    /// Process-wide heavy-job gate (`CODESEARCH_INDEX_JOBS`): bounds how many
+    /// repos run a refresh / reindex / HNSW build at once. It is attached to
+    /// every [`SharedStores`] this state opens, so cold opens, warmup and
+    /// file-watcher refreshes all draw from the same budget. Queries never
+    /// take it. See [`crate::limits`].
+    job_gate: Arc<crate::limits::JobGate>,
     /// Serve-wide default embedding model for newly created indexes
     /// (`codesearch serve --model <name>`), or `None` for the built-in default.
     ///
@@ -420,6 +426,7 @@ impl ServeState {
             embedding_pool: Arc::new(crate::embed::EmbeddingServicePool::new(
                 crate::constants::get_global_models_cache_dir().ok(),
             )),
+            job_gate: crate::limits::JobGate::from_env(),
             default_model: None,
             legacy_model_warned: DashMap::new(),
             tool_call_counts: DashMap::new(),
@@ -2510,6 +2517,9 @@ impl ServeState {
             }
         };
         if let Some(total_chunks) = needs_build {
+            // HNSW construction is one of the heaviest single operations a repo
+            // can do; draw the process-wide job permit around it.
+            let _job_permit = stores.acquire_job_permit().await;
             info!(
                 "Warmup '{}': building vector index ({} existing chunks)",
                 alias, total_chunks
@@ -2704,6 +2714,8 @@ impl ServeState {
         // "Index not built" until the background refresh completes.
         // build_index() is CPU-heavy — offload to the blocking pool so the async
         // runtime is not stalled while building the HNSW index for large repos.
+        // The open itself is part of a heavy job: hold a process-wide permit.
+        let _job_permit = stores.acquire_job_permit().await;
         {
             let vector_store = Arc::clone(&stores.vector_store);
             let alias_owned = alias.to_string();
@@ -2983,7 +2995,7 @@ impl ServeState {
             return match SharedStores::new_readonly(db_path, dims) {
                 Ok(s) => {
                     info!("Opened repo in readonly mode (forced by config): {}", alias);
-                    let stores_arc = Arc::new(s);
+                    let stores_arc = Arc::new(s.with_job_gate(Arc::clone(&self.job_gate)));
                     self.repos.insert(
                         alias.to_string(),
                         RepoState::Readonly {
@@ -3003,7 +3015,9 @@ impl ServeState {
         match SharedStores::new(db_path, dims) {
             Ok(s) => {
                 info!("Opened repo in write mode: {}", alias);
-                Ok(OpenedStores::Write(Arc::new(s)))
+                Ok(OpenedStores::Write(Arc::new(
+                    s.with_job_gate(Arc::clone(&self.job_gate)),
+                )))
             }
             Err(write_err) => {
                 if allow_create {
@@ -3015,7 +3029,7 @@ impl ServeState {
                 match SharedStores::new_readonly(db_path, dims) {
                     Ok(s) => {
                         info!("Opened repo in readonly mode: {}", alias);
-                        let stores_arc = Arc::new(s);
+                        let stores_arc = Arc::new(s.with_job_gate(Arc::clone(&self.job_gate)));
                         self.repos.insert(
                             alias.to_string(),
                             RepoState::Readonly {
@@ -4878,7 +4892,9 @@ async fn add_repo_handler(
         }
 
         // Build vector index from freshly indexed data.
-        // build_index() is CPU-heavy — offload to the blocking pool.
+        // build_index() is CPU-heavy — offload to the blocking pool, under the
+        // same process-wide job permit as every other heavy pass.
+        let _job_permit = stores.acquire_job_permit().await;
         {
             let vector_store = Arc::clone(&stores.vector_store);
             let alias_bi = alias_bg.clone();
@@ -5693,6 +5709,22 @@ pub async fn run_serve(
     // it. In particular the embedded TUI must NOT derive a poll cadence from it
     // — it never polls a federated peer on a timer at all.
     let serve_state = Arc::new(ServeState::new(config, None).with_default_model(default_model));
+
+    // One line that answers "why is it slower / less parallel than before?"
+    // without grepping the code: the effective heavy-work budget.
+    info!(
+        "⚙️  Indexing limits: index_jobs={} (CODESEARCH_INDEX_JOBS), embed_threads={} \
+         (CODESEARCH_EMBED_THREADS), embed_pause_ms={} (CODESEARCH_EMBED_PAUSE_MS), \
+         min_free_mb={} (CODESEARCH_MIN_FREE_MB), max_chunks_per_batch={} \
+         (CODESEARCH_MAX_CHUNKS_PER_BATCH)",
+        serve_state.job_gate.index_jobs(),
+        crate::limits::embed_threads()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "default".to_string()),
+        crate::limits::embed_pause().as_millis(),
+        crate::limits::min_free_mb(),
+        crate::limits::max_chunks_per_batch(),
+    );
 
     // Construct the bind address from resolved host + port.
     // Using `format!` with `parse::<SocketAddr>()` handles both IPv4 and IPv6.

@@ -9,6 +9,7 @@ mod federation;
 mod file;
 mod fts;
 mod index;
+mod limits;
 mod lmdb_registry;
 mod logger;
 mod mcp;

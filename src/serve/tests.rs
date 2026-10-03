@@ -2,6 +2,33 @@ use super::*;
 use serial_test::serial;
 use std::io::Write;
 
+#[tokio::test]
+async fn try_open_stores_attaches_the_serve_job_gate() {
+    // Serve-opened stores must carry the same process-wide gate as the
+    // ServeState, so cold opens, warmup and FSW refreshes all draw from one
+    // heavy-job budget (CODESEARCH_INDEX_JOBS).
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("repo").join(DB_DIR_NAME);
+    let state = std::sync::Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    let stores = match state
+        .try_open_stores("repo", &db_path, true, false, None)
+        .expect("a fresh repo must open in write mode")
+    {
+        OpenedStores::Write(s) => s,
+        OpenedStores::Readonly(_) => panic!("allow_create=true must open write mode"),
+    };
+
+    let store_gate = stores
+        .job_gate
+        .as_ref()
+        .expect("serve-opened stores must carry the job gate");
+    assert!(
+        std::sync::Arc::ptr_eq(store_gate, &state.job_gate),
+        "the store gate must be the ServeState gate"
+    );
+}
+
 #[test]
 fn test_api_key_matches() {
     assert!(api_key_matches("secret-key", "secret-key"));
