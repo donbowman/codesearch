@@ -233,7 +233,7 @@ If your agent skips codesearch and falls back to grep/glob too often, paste this
 
 > Prefer codesearch for semantic, cross-file, or symbol-oriented lookup ("where is X implemented", "find usages of Y", "how does Z flow"). Use plain grep/glob for a single known file, trivial one-line edits, or exact literal searches. In remote-serve mode, returned paths are from the **server's** filesystem — read content via `get_chunk` rather than opening paths locally, and unindexed dirs (`.venv`, `node_modules`, `build/`) simply return nothing.
 
-OpenCode: put this in the user-level `~/.config/opencode/AGENTS.md` (applies across all projects). Claude Code reads a project-level `AGENTS.md`, so add it per-project (or symlink a shared one).
+OpenCode: put this in the user-level `~/.config/opencode/AGENTS.md` (applies across all projects), or install the [OpenCode plugin](integrations/opencode/README.md), which injects this guidance with the resolved project scope automatically. Claude Code reads a project-level `AGENTS.md`, so add it per-project (or symlink a shared one).
 
 **Claude Code specifically** tends to ignore this advice more than other clients — its MCP tool schemas are deferred (an extra `ToolSearch` call is needed before codesearch tools are even callable), while Grep/Glob are always fully loaded and zero-friction, and spawned subagents don't inherit `AGENTS.md` or the MCP `initialize` instructions at all.
 
@@ -252,6 +252,8 @@ codesearch hooks claude install --project  # project scope (./.claude)
 ```
 
 The native command embeds the hook scripts in the binary (no source tree needed) and merges the registrations into `settings.json`. The equivalent from-source installers still live in [`integrations/claude-code/`](integrations/claude-code/) (`install.ps1` / `install.sh`) if you'd rather run them directly.
+
+**OpenCode** gets the same structural treatment through the OpenCode v2 plugin in [`integrations/opencode/`](integrations/opencode/README.md): it resolves the session directory to an indexed project, injects scope-aware guidance once per session, rescues empty greps with index hits, optionally prunes or blocks `grep`/`glob`, keeps the serve hub healthy (with optional auto-start), and adds `/codesearch*` commands, a `codesearch_scope` tool, a skill and compaction assistance. Install by copying `codesearch.ts` into `~/.config/opencode/plugins/` — see the [integration README](integrations/opencode/README.md).
 
 Note: the grep-guard detects "codesearch is available **for this repo**" via that repo's registration with the serve hub (`~/.codesearch/repos.json`, honoring the `CODESEARCH_REPOS_CONFIG` override) or `CODESEARCH_SERVER` — **not** by checking whether a `codesearch` process is running (that runs almost constantly as a multi-repo hub and would false-fire in every directory), and **not** via a local `.codesearch.db` directory (a stale db from a since-unregistered repo used to deny Grep even though the hub could not answer for it). For a remote-serve setup with no local registration, set `CODESEARCH_SERVER` to opt back into enforcement.
 
