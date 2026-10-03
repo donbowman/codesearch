@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.5.1]
+
+### Fixed
+
+- **Queued reindexes are no longer cancelled as "leaked", and an unjoinable index task can no longer wedge a hub.** With the process-wide job gate (`CODESEARCH_INDEX_JOBS=1`, the default), tasks queued behind a long-running job held their `active_reindexes` markers past `MAX_INDEXING_SECS` without renewing them, so the lazy stale-marker check evicted the markers and cancelled the parked tasks — leaving empty stores and in-process LMDB handles that made later writes fail with "Database is locked by another process" until a serve restart. Separately, `await_index_task` removed the task entry *before* waiting and dropped the `JoinHandle` on timeout, so a task too deep in the uninterruptible `build_index` to cancel kept its `Arc<SharedStores>` and the single job permit invisibly; the job-gate wait ignored cancellation, parking cancelled tasks on the gate; and `remove_repo` / format recovery could delete the DB directory out from under a still-running task. Now: a marker backed by a live tracked `Reindex` task is renewed (with a throttled wedge warning) instead of reaped; gate acquisition is cancellation-aware (`JobAcquire`) so cancelled or removed queued jobs abort and release their stores; a task that cannot be joined stays tracked and is reaped by a periodic sweeper that also deletes orphaned DB directories and re-asserts cancellation for removed repos; DB deletion is deferred while the task runs; format recovery refuses to wipe in that state; and stale markers from other owners are still evicted.
+
 ## [1.5.0] - 2026-10-03
 
 ### Added

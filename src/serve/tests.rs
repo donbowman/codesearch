@@ -190,9 +190,15 @@ async fn await_index_task_cancels_and_joins_indexing_task() {
         }
         done_clone.store(true, std::sync::atomic::Ordering::SeqCst);
     });
-    state
-        .index_tasks
-        .insert("repo-x".to_string(), (handle, token));
+    state.index_tasks.insert(
+        "repo-x".to_string(),
+        IndexTask {
+            handle,
+            token,
+            db_path: std::path::PathBuf::from("/nonexistent-db"),
+            started_at: Instant::now(),
+        },
+    );
     state.await_index_task("repo-x").await;
     assert!(
         !state.index_tasks.contains_key("repo-x"),
@@ -329,9 +335,15 @@ async fn remove_repo_during_active_build_self_cleans_db_dir() {
         // orphaned — self-clean it now that the build's handles are released.
         ServeState::remove_orphaned_db_dir("buildrepo", &db_path_for_cleanup);
     });
-    state
-        .index_tasks
-        .insert("buildrepo".to_string(), (handle, token));
+    state.index_tasks.insert(
+        "buildrepo".to_string(),
+        IndexTask {
+            handle,
+            token,
+            db_path: db_path.clone(),
+            started_at: Instant::now(),
+        },
+    );
 
     // remove_repo lands WHILE the spawn_blocking build is still sleeping.
     let outcome = state
@@ -3025,13 +3037,15 @@ async fn a_second_format_recovery_for_the_same_alias_is_refused() {
 
 #[tokio::test]
 #[serial]
-async fn stale_indexing_marker_cancels_the_leaked_index_task() {
-    // Regression: evicting the stale marker used to fix only what the TUI
-    // believed. The task itself kept running and kept its `Arc<SharedStores>`
-    // — so the LMDB env and `.writer.lock` stayed held and every later write
-    // failed with "Database is locked by another process" on a repo that
-    // logged as idle and closed.
-    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "1")]);
+async fn await_index_task_cancels_and_releases_the_task_handles() {
+    // Regression: a leaked index task used to keep its `Arc<SharedStores>`
+    // after every cooperative path forgot it — the LMDB env and
+    // `.writer.lock` stayed held, and later writes failed with "Database is
+    // locked by another process" on a repo that logged as idle. Cancellation
+    // must be delivered AND the handle joined (not detached), so the stores
+    // are released. The staleness check no longer cancels live tasks (see
+    // `stale_marker_with_live_task_is_renewed_not_cancelled`);
+    // `await_index_task` is the cancellation trigger.
     let state = Arc::new(ServeState::new(ReposConfig::default(), None));
 
     // Stand-in for the store handles the real task captures.
@@ -3043,39 +3057,32 @@ async fn stale_indexing_marker_cancels_the_leaked_index_task() {
         task_token.cancelled().await;
         drop(stores_task);
     });
-    state
-        .index_tasks
-        .insert("leaky".to_string(), (handle, token.clone()));
-    state.active_reindexes.insert(
+    state.index_tasks.insert(
         "leaky".to_string(),
-        std::iter::once((
-            IndexingOwner::Reindex,
-            Instant::now()
-                .checked_sub(Duration::from_secs(2))
-                .expect("monotonic clock at least 2s old"),
-        ))
-        .collect(),
+        IndexTask {
+            handle,
+            token: token.clone(),
+            db_path: std::path::PathBuf::from("/nonexistent-db"),
+            started_at: Instant::now(),
+        },
     );
 
     assert!(
-        !state.is_indexing("leaky"),
-        "a marker older than the timeout must not read as indexing"
+        state.await_index_task("leaky").await,
+        "a task observing cancellation must join within the cooperative budget"
     );
     assert!(
         token.is_cancelled(),
-        "the leaked task must be cancelled, not merely forgotten"
+        "the cancelled task must observe cancellation"
     );
-
-    let (handle, _) = state
-        .index_tasks
-        .remove("leaky")
-        .expect("task entry kept")
-        .1;
-    handle.await.expect("cancelled task joins cleanly");
+    assert!(
+        !state.index_tasks.contains_key("leaky"),
+        "a joined task must be reaped from index_tasks"
+    );
     assert_eq!(
         Arc::strong_count(&stores),
         1,
-        "the leaked task must have released its store handle"
+        "the cancelled task must have released its store handle"
     );
 }
 
@@ -3088,9 +3095,15 @@ async fn fresh_indexing_marker_leaves_its_index_task_running() {
     let token = CancellationToken::new();
     let task_token = token.clone();
     let handle = tokio::spawn(async move { task_token.cancelled().await });
-    state
-        .index_tasks
-        .insert("busy".to_string(), (handle, token.clone()));
+    state.index_tasks.insert(
+        "busy".to_string(),
+        IndexTask {
+            handle,
+            token: token.clone(),
+            db_path: std::path::PathBuf::from("/nonexistent-db"),
+            started_at: Instant::now(),
+        },
+    );
     state.begin_indexing("busy", IndexingOwner::Reindex);
 
     assert!(
@@ -3850,4 +3863,318 @@ fn evaluate_stays_fresh_when_index_is_current_and_clean() {
         !state.degraded_rebuild_attempted.contains("cleanidx"),
         "a clean index must not consume the degraded retry"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Queue-backlog regressions: tracked index tasks, stale-marker liveness,
+// deferred DB cleanup.
+// ---------------------------------------------------------------------------
+
+/// Age `alias`'s Reindex marker past the stale threshold.
+fn aged_marker(state: &ServeState, alias: &str) {
+    state
+        .active_reindexes
+        .entry(alias.to_string())
+        .or_default()
+        .insert(
+            IndexingOwner::Reindex,
+            Instant::now() - Duration::from_secs(MAX_INDEXING_SECS * 2),
+        );
+}
+
+/// A handle whose task has already completed (the handle is kept, not awaited).
+async fn finished_handle() -> tokio::task::JoinHandle<()> {
+    let handle = tokio::spawn(async {});
+    while !handle.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    handle
+}
+
+fn tracked_task(handle: tokio::task::JoinHandle<()>, db_path: std::path::PathBuf) -> IndexTask {
+    IndexTask {
+        handle,
+        token: CancellationToken::new(),
+        db_path,
+        started_at: Instant::now(),
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn stale_marker_with_live_task_is_renewed_not_cancelled() {
+    // Regression: a reindex task queued behind the process-wide job gate can
+    // outlive MAX_INDEXING_SECS without being a leak. Evicting its marker and
+    // cancelling the task cancels healthy queued work whenever a backlog
+    // outlives the threshold.
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let alias = "live-task-repo";
+    let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    let token = CancellationToken::new();
+    state.index_tasks.insert(
+        alias.to_string(),
+        IndexTask {
+            handle,
+            token: token.clone(),
+            db_path: std::path::PathBuf::from("/nonexistent-db"),
+            started_at: Instant::now(),
+        },
+    );
+
+    aged_marker(&state, alias);
+    assert!(
+        !state.begin_indexing(alias, IndexingOwner::Reindex),
+        "a live task must block a second run even with a stale marker"
+    );
+
+    // A stale marker owned by another flow (Watcher) carries no liveness
+    // evidence of its own and must still be evicted, even while the index
+    // task lives.
+    state
+        .active_reindexes
+        .entry(alias.to_string())
+        .or_default()
+        .insert(
+            IndexingOwner::Watcher,
+            Instant::now() - Duration::from_secs(MAX_INDEXING_SECS * 2),
+        );
+    aged_marker(&state, alias);
+    assert!(
+        state.is_indexing(alias),
+        "a live task must keep reporting indexing"
+    );
+    assert!(
+        state
+            .active_reindexes
+            .get(alias)
+            .is_some_and(|owners| !owners.contains_key(&IndexingOwner::Watcher)),
+        "a stale non-Reindex marker must still be evicted"
+    );
+    assert!(
+        !token.is_cancelled(),
+        "the marker check must never cancel a live task"
+    );
+    let renewed = state
+        .active_reindexes
+        .get(alias)
+        .and_then(|owners| owners.get(&IndexingOwner::Reindex).copied())
+        .expect("the marker must survive the check");
+    assert!(
+        Instant::now().duration_since(renewed) < Duration::from_secs(5),
+        "a live marker must be renewed, not evicted"
+    );
+
+    {
+        let entry = state.index_tasks.get(alias);
+        if let Some(entry) = entry {
+            entry.value().handle.abort();
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn stale_marker_without_live_task_is_evicted_and_entry_reaped() {
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let alias = "dead-task-repo";
+    let handle = finished_handle().await;
+    state.index_tasks.insert(
+        alias.to_string(),
+        tracked_task(handle, std::path::PathBuf::from("/nonexistent-db")),
+    );
+    aged_marker(&state, alias);
+
+    assert!(
+        !state.is_indexing(alias),
+        "with no live task the stale marker must be evicted"
+    );
+    assert!(
+        !state.index_tasks.contains_key(alias),
+        "the finished entry must be reaped"
+    );
+    assert!(
+        !state.active_reindexes.contains_key(alias),
+        "the evicted marker must be cleaned up"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn sweeper_reaps_finished_unregistered_task_and_cleans_db() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("gone-repo").join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(db_path.join("metadata.json"), b"{}").unwrap();
+
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let handle = finished_handle().await;
+    state.index_tasks.insert(
+        "gone-repo".to_string(),
+        tracked_task(handle, db_path.clone()),
+    );
+    state
+        .active_reindexes
+        .entry("gone-repo".to_string())
+        .or_default()
+        .insert(IndexingOwner::Reindex, Instant::now());
+
+    state.sweep_index_tasks();
+
+    assert!(!state.index_tasks.contains_key("gone-repo"));
+    assert!(!db_path.exists(), "the orphaned DB dir must be deleted");
+    assert!(!state.active_reindexes.contains_key("gone-repo"));
+}
+
+#[tokio::test]
+#[serial]
+async fn await_index_task_timeout_keeps_task_tracked() {
+    // Regression: the old code removed the entry before waiting and dropped
+    // the handle on timeout, making the detached task invisible while it held
+    // its stores and the job permit.
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let alias = "parked-task";
+    let token = CancellationToken::new();
+    let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    state.index_tasks.insert(
+        alias.to_string(),
+        IndexTask {
+            handle,
+            token: token.clone(),
+            db_path: std::path::PathBuf::from("/nonexistent-db"),
+            started_at: Instant::now(),
+        },
+    );
+
+    let exited = state
+        .await_index_task_with_budget(alias, Duration::from_millis(50))
+        .await;
+    assert!(!exited, "a parked task cannot exit within the budget");
+    assert!(
+        state.index_tasks.contains_key(alias),
+        "the task must stay tracked — never invisible"
+    );
+    assert!(token.is_cancelled(), "cancellation must still be signalled");
+
+    {
+        let entry = state.index_tasks.get(alias);
+        if let Some(entry) = entry {
+            entry.value().handle.abort();
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn await_index_task_returns_true_when_task_exits() {
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let handle = tokio::spawn(async {});
+    state.index_tasks.insert(
+        "quick-task".to_string(),
+        tracked_task(handle, std::path::PathBuf::from("/nonexistent-db")),
+    );
+    assert!(
+        state
+            .await_index_task_with_budget("quick-task", Duration::from_secs(5))
+            .await
+    );
+    assert!(!state.index_tasks.contains_key("quick-task"));
+}
+
+#[tokio::test]
+#[serial]
+async fn remove_repo_defers_db_delete_while_index_task_is_still_running() {
+    // Regression: deleting the DB dir under a live (uninterruptible) index
+    // task is what can wedge a hub — the task never reaches a cancellation
+    // point and keeps its stores and the job permit for the process lifetime.
+    let (_tmp, repo_path, state) = state_with_repo("slowrepo");
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(db_path.join("data.mdb"), "fake").unwrap();
+
+    // A task that ignores cancellation entirely, like a parked build.
+    let token = CancellationToken::new();
+    let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    state.index_tasks.insert(
+        "slowrepo".to_string(),
+        IndexTask {
+            handle,
+            token,
+            db_path: db_path.clone(),
+            started_at: Instant::now(),
+        },
+    );
+
+    let outcome = state
+        .remove_repo_with_budget("slowrepo", Duration::from_millis(100))
+        .await
+        .expect("remove_repo should succeed");
+
+    assert!(
+        !outcome.db_deleted,
+        "the DB dir must NOT be deleted out from under a live task"
+    );
+    assert!(db_path.exists(), "the dir stays until the task exits");
+    assert!(
+        state.index_tasks.contains_key("slowrepo"),
+        "the running task must stay tracked for the sweeper"
+    );
+
+    // Simulate the task finally exiting (aborted here; a real one would run
+    // its post-build guard): the sweeper is the backstop that reaps the entry
+    // and deletes the orphaned dir.
+    if let Some(entry) = state.index_tasks.get("slowrepo") {
+        entry.value().handle.abort();
+    }
+    loop {
+        let finished = state
+            .index_tasks
+            .get("slowrepo")
+            .is_some_and(|entry| entry.value().handle.is_finished());
+        if finished {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    state.sweep_index_tasks();
+
+    assert!(!state.index_tasks.contains_key("slowrepo"));
+    assert!(
+        !db_path.exists(),
+        "the sweeper must clean the orphaned DB dir"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn sweeper_reasserts_cancellation_for_a_removed_live_task() {
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let token = CancellationToken::new();
+    let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    state.index_tasks.insert(
+        "removed-repo".to_string(),
+        IndexTask {
+            handle,
+            token: token.clone(),
+            db_path: std::path::PathBuf::from("/nonexistent-db"),
+            started_at: Instant::now(),
+        },
+    );
+
+    state.sweep_index_tasks();
+
+    assert!(
+        token.is_cancelled(),
+        "a removed repo's live task must have cancellation re-asserted"
+    );
+    assert!(
+        state.index_tasks.contains_key("removed-repo"),
+        "a live task must stay tracked until it exits"
+    );
+
+    {
+        let entry = state.index_tasks.get("removed-repo");
+        if let Some(entry) = entry {
+            entry.value().handle.abort();
+        }
+    }
 }

@@ -48,6 +48,7 @@ use crate::index::{
     CSharpRebuildNotifier, IndexManager, IndexingHeartbeat, IndexingStatusCallback, SharedStores,
     SymbolRebuildSignal,
 };
+use crate::limits::JobAcquire;
 use crate::mcp::types::HealthResponse;
 use crate::symbols::{csharp, RebuildScope, SymbolIndexerRegistry};
 
@@ -221,6 +222,19 @@ pub(crate) enum IndexingOwner {
     Symbol,
 }
 
+/// A tracked background indexing task.
+///
+/// `db_path` travels with the entry so the DB directory of a repo that was
+/// removed mid-index can be cleaned up after the task finally exits, and
+/// `started_at` lets the periodic sweeper report tasks that have been alive
+/// past the stale threshold (a wedge signal for operators).
+struct IndexTask {
+    handle: tokio::task::JoinHandle<()>,
+    token: CancellationToken,
+    db_path: PathBuf,
+    started_at: Instant,
+}
+
 /// Shared state for the serve mode.
 pub(crate) struct ServeState {
     /// Repo alias → opened stores (or conflicted marker).
@@ -255,22 +269,28 @@ pub(crate) struct ServeState {
     /// `stop_fsw`) so the LMDB `Environment` drops and releases the file
     /// handles BEFORE the DB directory is deleted. See `await_fsw_shutdown`.
     fsw_tasks: DashMap<String, tokio::task::JoinHandle<()>>,
-    /// Repo alias → `(JoinHandle, CancellationToken)` of its background
-    /// *indexing* task (the heavy `add_repo`/`reindex` embed pass), separate
-    /// from `fsw_tasks` because `restart_fsw` reuses the `fsw_tasks` slot for
-    /// the continuous watcher loop.
+    /// Repo alias → its tracked background *indexing* task (the heavy
+    /// `add_repo`/`reindex` embed pass), separate from `fsw_tasks` because
+    /// `restart_fsw` reuses the `fsw_tasks` slot for the continuous watcher
+    /// loop.
     ///
     /// This exists to fix the index-cancellation no-op (BUG1): `add_repo` and
     /// `reindex` used to spawn detached, untracked `tokio::spawn` tasks that
     /// neither observed the cancel token nor could be awaited, so `remove_repo`
     /// reported success while a full-corpus embed pass kept running (and
     /// writing) on the removed alias — 6 GB / 52% CPU runaway. Registering the
-    /// handle here lets `await_index_task` (called from `remove_repo`) cancel
-    /// the token AND await the task before the DB directory is deleted, so the
-    /// task's `Arc<SharedStores>` (and the LMDB mmap handles it keeps alive)
-    /// drop first. The token is stored alongside the handle so `remove_repo`
-    /// can cancel regardless of the repo's `RepoState` variant.
-    index_tasks: DashMap<String, (tokio::task::JoinHandle<()>, CancellationToken)>,
+    /// task here lets `await_index_task` (called from `remove_repo`) cancel the
+    /// token AND wait for the task, so the task's `Arc<SharedStores>` (and the
+    /// LMDB mmap handles it keeps alive) drop first. The entry is *never*
+    /// dropped while the task may still run: when the cooperative wait cannot
+    /// join it (uninterruptible `build_index`), the handle goes back into this
+    /// map so [`Self::sweep_index_tasks`] can reap it — and clean up a removed
+    /// repo's DB directory — once it finally exits.
+    index_tasks: DashMap<String, IndexTask>,
+    /// Repo alias → last time [`Self::is_indexing`] / [`Self::sweep_index_tasks`]
+    /// warned that a *live* task's marker crossed `MAX_INDEXING_SECS`.
+    /// Throttles the wedge warning to once per alias per few minutes.
+    stale_live_warned: DashMap<String, Instant>,
     /// Aliases detected with LMDB storage-format corruption (e.g.
     /// `MDB_BAD_VALSIZE` after a storage-layer major upgrade such as
     /// arroy 0.5→0.8 / heed 0.20→0.22), queued for a wipe + full force
@@ -446,6 +466,7 @@ impl ServeState {
             open_locks: DashMap::new(),
             fsw_tasks: DashMap::new(),
             index_tasks: DashMap::new(),
+            stale_live_warned: DashMap::new(),
             format_recovery_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
             format_recovery_done: DashMap::new(),
             format_recovery_worker_started: std::sync::atomic::AtomicBool::new(false),
@@ -706,18 +727,37 @@ impl ServeState {
     }
 
     /// Mark `alias` as actively indexing for `owner`, returning `true` if the
-    /// caller may proceed. Returns `false` when **any** owner holds a
-    /// non-stale marker (i.e. another indexing run is genuinely in progress) —
-    /// in that case the caller should return HTTP 409. Stale markers from
-    /// leaked/crashed tasks are silently dropped first.
+    /// caller may proceed. Returns `false` when **any** owner holds a live
+    /// marker (i.e. another indexing run is genuinely in progress) — in that
+    /// case the caller should return HTTP 409. Stale markers from leaked
+    /// tasks are dropped first, but a marker whose tracked task is still
+    /// alive is never treated as stale: queued-behind-the-gate jobs can wait
+    /// far past `MAX_INDEXING_SECS` without being leaks.
     ///
     /// This is the guard used by `reindex_handler`, `add_repo_handler`, and
     /// `spawn_force_reindex` to reject concurrent reindexes.
     fn begin_indexing(&self, alias: &str, owner: IndexingOwner) -> bool {
         let now = Instant::now();
         let max = self.indexing_timeout();
+        // Liveness is read before locking the marker map so the two DashMaps
+        // are never locked in a nested order.
+        let task_live = self.index_task_is_live(alias);
         let mut owners = self.active_reindexes.entry(alias.to_string()).or_default();
-        owners.retain(|_, ts| now.duration_since(*ts) < max);
+        owners.retain(|owner, ts| {
+            if now.duration_since(*ts) < max {
+                return true;
+            }
+            if task_live && *owner == IndexingOwner::Reindex {
+                // Not a leak: renew rather than drop, or a concurrent begin
+                // could double-run the repo. Only the tracked index task
+                // (Reindex) supplies liveness evidence; other owners' stale
+                // markers are dropped as before.
+                *ts = now;
+                true
+            } else {
+                false
+            }
+        });
         if owners.is_empty() {
             owners.insert(owner, now);
             true
@@ -857,7 +897,18 @@ impl ServeState {
         self.repos.remove(alias);
         self.last_access.remove(alias);
         self.await_fsw_shutdown(alias).await;
-        self.await_index_task(alias).await;
+        if !self.await_index_task(alias).await {
+            // The task is still alive (typically parked in the uninterruptible
+            // build_index). Wiping the DB dir from under it is unsafe — it can
+            // wedge the task while it holds the store handles and the
+            // process-wide job permit. Refuse and let the next corruption
+            // detection retry once the task exits.
+            return Err(format!(
+                "in-flight indexing task for '{}' did not stop within the cooperative \
+                 budget; refusing to wipe its DB dir",
+                alias
+            ));
+        }
 
         let deadline =
             Instant::now() + Duration::from_secs(crate::constants::DB_DELETE_RETRY_BUDGET_SECS);
@@ -958,7 +1009,7 @@ impl ServeState {
         let cancelled = self
             .index_tasks
             .get(alias)
-            .is_some_and(|entry| entry.value().1.is_cancelled());
+            .is_some_and(|entry| entry.value().token.is_cancelled());
         if cancelled {
             return Err(format!(
                 "rebuild for '{}' was cancelled before it completed (stale indexing marker); \
@@ -969,14 +1020,50 @@ impl ServeState {
         Ok(())
     }
 
-    /// Returns `true` if `alias` is currently (non-stale) indexing for any
-    /// owner.
+    /// True when a tracked indexing task for `alias` has not finished.
     ///
-    /// Stale markers — those older than [`MAX_INDEXING_SECS`] — are lazily
-    /// evicted here. This is the self-healing mechanism: even if a
-    /// fire-and-forget background task panics or is cancelled between
-    /// `begin_indexing` and `end_indexing`, its marker eventually expires and
-    /// the TUI returns to the correct state without a server restart.
+    /// Live-task evidence overrides marker age: a task queued behind the
+    /// process-wide job gate can wait far longer than `MAX_INDEXING_SECS`
+    /// without being a leak, and treating it as one (evict marker + cancel)
+    /// cancels healthy queued work whenever the backlog drains slower than the
+    /// threshold.
+    fn index_task_is_live(&self, alias: &str) -> bool {
+        self.index_tasks
+            .get(alias)
+            .is_some_and(|entry| !entry.value().handle.is_finished())
+    }
+
+    /// Throttled gate for the "live task past the stale threshold" warning:
+    /// true at most once per alias per five minutes.
+    fn stale_warn_due(&self, alias: &str) -> bool {
+        const WARN_EVERY: Duration = Duration::from_secs(300);
+        let now = Instant::now();
+        let due = match self.stale_live_warned.get_mut(alias) {
+            Some(mut last) => {
+                if now.duration_since(*last) < WARN_EVERY {
+                    false
+                } else {
+                    *last = now;
+                    true
+                }
+            }
+            None => true,
+        };
+        if due {
+            self.stale_live_warned.insert(alias.to_string(), now);
+        }
+        due
+    }
+
+    /// Returns `true` if `alias` is currently indexing for any owner.
+    ///
+    /// Markers older than [`MAX_INDEXING_SECS`] are aged out unless their
+    /// owner carries liveness evidence: a `Reindex` marker backed by a live
+    /// tracked index task is renewed instead. That keeps the self-healing
+    /// behavior for panicked or crashed tasks while never cancelling
+    /// live-but-slow work — a task queued on the process-wide job gate or a
+    /// long `build_index` routinely exceeds the threshold, and a backlog of
+    /// queued reindexes must drain instead of being cancelled as "leaked".
     ///
     /// Eviction runs under the shard's write lock (`get_mut` + `retain`), so a
     /// concurrent `begin_indexing`/`renew_indexing` that refreshed a marker in
@@ -986,16 +1073,26 @@ impl ServeState {
     /// predicate + removal).
     pub(crate) fn is_indexing(&self, alias: &str) -> bool {
         let max = self.indexing_timeout();
+        // Liveness is read before locking the marker map so the two DashMaps
+        // are never locked in a nested order.
+        let task_live = self.index_task_is_live(alias);
         let mut evicted: Vec<IndexingOwner> = Vec::new();
+        let mut renewed: Vec<IndexingOwner> = Vec::new();
         let mut any_left = false;
         if let Some(mut owners) = self.active_reindexes.get_mut(alias) {
             let now = Instant::now();
             owners.retain(|owner, ts| {
-                let fresh = now.duration_since(*ts) < max;
-                if !fresh {
-                    evicted.push(*owner);
+                if now.duration_since(*ts) < max {
+                    return true;
                 }
-                fresh
+                if task_live && *owner == IndexingOwner::Reindex {
+                    *ts = now;
+                    renewed.push(*owner);
+                    true
+                } else {
+                    evicted.push(*owner);
+                    false
+                }
             });
             any_left = !owners.is_empty();
         }
@@ -1004,56 +1101,123 @@ impl ServeState {
             // raced this eviction keeps its fresh marker.
             self.active_reindexes.remove_if(alias, |_, m| m.is_empty());
         }
+        if !renewed.is_empty() && self.stale_warn_due(alias) {
+            tracing::warn!(
+                "⏳ Indexing marker(s) for '{}' exceeded {}s but the tracked task is still \
+                 live (queued on the job gate, or a long-running build) — renewing, not \
+                 cancelling. Owners: {:?}",
+                alias,
+                max.as_secs(),
+                renewed
+            );
+        }
         if !evicted.is_empty() {
             tracing::warn!(
                 "🧹 Evicted stale indexing marker(s) for '{}' (older than {}s, owners \
-                 {:?}) — likely a leaked/crashed background task",
+                 {:?}) — no tracked task is alive; reaping",
                 alias,
                 max.as_secs(),
                 evicted
             );
-            self.cancel_stale_index_task(alias);
+            self.reap_finished_index_task(alias);
         }
         any_left
     }
 
-    /// Cancel the background index task still registered for `alias` after its
-    /// indexing marker was evicted as stale.
+    /// Reap the tracked index task for `alias` once its handle has finished.
     ///
-    /// Dropping the marker only fixes what the TUI and the reindex guard
-    /// *believe*; the task itself keeps running, and with it the
-    /// `Arc<SharedStores>` it captured — so the LMDB env and the
-    /// `.writer.lock` stay held for the process lifetime. Every later write
-    /// (reindex, format recovery, `POST /repos`) then fails with "Database is
-    /// locked by another process" even though the repo looks idle and closed.
-    /// Cancelling the task's token releases those handles at its next
-    /// cancellation point.
-    ///
-    /// Cooperative only: the handle is never aborted (see
-    /// [`Self::await_index_task`] — an abort would detach the blocking
-    /// `build_index` that owns its own store clone and drop the post-build
-    /// self-cleanup), and the entry stays registered so `remove_repo` can
-    /// still join it. A task that already finished is reaped here instead.
-    fn cancel_stale_index_task(&self, alias: &str) {
-        let finished = match self.index_tasks.get(alias) {
-            Some(entry) => {
-                let (handle, token) = entry.value();
-                if handle.is_finished() {
-                    true
-                } else {
-                    token.cancel();
-                    tracing::warn!(
-                        "🧹 Cancelled the leaked index task for '{}' — releasing its store \
-                         handles and writer lock",
-                        alias
-                    );
-                    false
-                }
-            }
-            None => return,
+    /// Called after stale markers are evicted (there is no live task by
+    /// definition) and from the periodic [`Self::sweep_index_tasks`]. A
+    /// running task is never cancelled here, however old its marker: only
+    /// [`Self::remove_repo`] cancels, and only for its own alias.
+    fn reap_finished_index_task(&self, alias: &str) {
+        let Some(entry) = self.index_tasks.get(alias) else {
+            return;
         };
-        if finished {
-            self.index_tasks.remove(alias);
+        if !entry.value().handle.is_finished() {
+            return;
+        }
+        let db_path = entry.value().db_path.clone();
+        drop(entry);
+        if self
+            .index_tasks
+            .remove_if(alias, |_, v| v.handle.is_finished())
+            .is_some()
+        {
+            self.stale_live_warned.remove(alias);
+            // A finished task that left markers behind panicked or errored
+            // without `end_indexing`; with no task left they are stale state.
+            // Only the Reindex owner belongs to the index task — the other
+            // owners (Warmup, Watcher, Symbol) manage their own lifecycle.
+            if !self.index_tasks.contains_key(alias) {
+                if let Some(mut owners) = self.active_reindexes.get_mut(alias) {
+                    owners.remove(&IndexingOwner::Reindex);
+                }
+                self.active_reindexes.remove_if(alias, |_, m| m.is_empty());
+            }
+            // Covers the removed-mid-build case where the task exited via a
+            // path that never reached its post-build self-clean.
+            self.self_clean_if_unregistered(alias, &db_path);
+        }
+    }
+
+    /// Periodic sweep of tracked index tasks (runs on the idle-reaper tick).
+    ///
+    /// Finishes what cooperative removal could not: reaps entries whose tasks
+    /// finally exited (clearing leftover markers and deleting a removed
+    /// repo's DB directory), re-asserts cancellation for tasks whose repo is
+    /// gone, and loudly reports tasks alive far past the stale threshold —
+    /// the wedge signal an operator needs. Live tasks are never cancelled
+    /// here.
+    fn sweep_index_tasks(&self) {
+        let entries: Vec<(String, bool, Duration)> = self
+            .index_tasks
+            .iter()
+            .map(|e| {
+                let v = e.value();
+                (
+                    e.key().clone(),
+                    v.handle.is_finished(),
+                    v.started_at.elapsed(),
+                )
+            })
+            .collect();
+        let max = self.indexing_timeout();
+        for (alias, finished, age) in entries {
+            if finished {
+                self.reap_finished_index_task(&alias);
+                continue;
+            }
+            let registered = self
+                .config
+                .read()
+                .map(|c| c.resolve(&alias).is_some())
+                .unwrap_or(true);
+            if !registered {
+                // A removed alias's task has no reason to keep going. The
+                // token was cancelled by remove_repo; re-assert it
+                // (idempotent, cooperative) so the entry can be reaped at its
+                // next cancellation point.
+                if let Some(entry) = self.index_tasks.get(&alias) {
+                    if !entry.value().token.is_cancelled() {
+                        entry.value().token.cancel();
+                        tracing::warn!(
+                            "🧹 Index task for removed repo '{}' is still live — \
+                             cancellation re-asserted",
+                            alias
+                        );
+                    }
+                }
+                continue;
+            }
+            if age > max && self.stale_warn_due(&alias) {
+                tracing::warn!(
+                    "⏳ Index task for '{}' has been live for {}s with no completion — \
+                     possible wedge; it stays tracked and will be reaped when it exits",
+                    alias,
+                    age.as_secs()
+                );
+            }
         }
     }
 
@@ -1948,6 +2112,21 @@ impl ServeState {
     /// This is the shared logic used by both the HTTP `DELETE /repos/{alias}` handler
     /// and the TUI confirmation flow.
     pub(crate) async fn remove_repo(&self, alias: &str) -> Result<RepoRemovalOutcome> {
+        self.remove_repo_with_budget(
+            alias,
+            std::time::Duration::from_secs(crate::constants::BG_TASK_COOPERATIVE_TIMEOUT_SECS),
+        )
+        .await
+    }
+
+    /// [`Self::remove_repo`] with an injectable cooperative budget for the
+    /// index-task wait (tests use a short one; production passes
+    /// `BG_TASK_COOPERATIVE_TIMEOUT_SECS`).
+    pub(crate) async fn remove_repo_with_budget(
+        &self,
+        alias: &str,
+        index_task_budget: Duration,
+    ) -> Result<RepoRemovalOutcome> {
         // 1. Resolve project path from config
         let project_path = {
             let config = self
@@ -1981,9 +2160,15 @@ impl ServeState {
         // above cancelled a token nobody listened to, this await found nothing
         // to wait on, and the embed pass kept running (writing chunks, holding
         // the LMDB mmap open) long after remove_repo reported success.
-        // await_index_task cancels the task's OWN token and awaits its exit, so
-        // its Arc<SharedStores> drops before the DB delete below.
-        self.await_index_task(alias).await;
+        // await_index_task cancels the task's OWN token and waits for its
+        // exit, so its Arc<SharedStores> drops before the DB delete below. It
+        // returns false when the task could not be joined within the
+        // cooperative budget (e.g. parked in an uninterruptible build): the DB
+        // delete is then DEFERRED instead of pulling the directory out from
+        // under the live build.
+        let index_task_exited = self
+            .await_index_task_with_budget(alias, index_task_budget)
+            .await;
 
         // 3. Unregister from repos.json
         {
@@ -2022,7 +2207,24 @@ impl ServeState {
         // report honestly.
         let mut db_deleted = !db_path.exists();
         let mut db_delete_error: Option<String> = None;
-        if db_path.exists() {
+        if db_path.exists() && !index_task_exited {
+            // The index task is still alive (typically parked in the
+            // uninterruptible `build_index`). Deleting the directory out from
+            // under it can wedge a serve process: the task's
+            // mmapped LMDB/arroy/Tantivy files vanished mid-build, it never
+            // reached a cancellation point, and it then held its
+            // `Arc<SharedStores>` plus the process-wide job permit for the
+            // process lifetime. Defer instead: the task's post-build guard
+            // (`self_clean_if_unregistered`) deletes the dir once it observes
+            // the removal, and [`Self::sweep_index_tasks`] retries if a panic
+            // skips that path.
+            tracing::warn!(
+                "Database dir for '{}' left in place: its index task is still running \
+                 (cleanup deferred to the task's post-build guard / sweeper)",
+                alias
+            );
+            db_delete_error = Some("index task still running; DB cleanup deferred".to_string());
+        } else if db_path.exists() {
             // Deadline-bounded exponential-backoff retry. We ONLY retry on
             // lock-class errors (sharing/lock violation or access-denied on
             // Windows, or a message hinting the dir is in use) — a genuine
@@ -2252,58 +2454,85 @@ impl ServeState {
         }
     }
 
-    /// Cancel and await the background *indexing* task for `alias`
-    /// (`add_repo`/`reindex` embed pass), if one is registered in
+    /// Cancel and wait (bounded) for the background *indexing* task for
+    /// `alias` (`add_repo`/`reindex` embed pass), if one is registered in
     /// [`Self::index_tasks`].
     ///
-    /// Cancels the task's token first (so an in-flight embed pass aborts at the
-    /// next batch/phase boundary), then awaits its `JoinHandle` with a 5s
-    /// timeout. The await is what guarantees the task's `Arc<SharedStores>` —
-    /// and the LMDB mmap handles it keeps alive on Windows — have actually
-    /// dropped before `remove_repo` deletes the DB directory. Without this,
-    /// `remove_repo` would delete `repos.json` while the detached task kept
-    /// writing chunks into a soon-to-be-orphaned `.codesearch.db`.
-    async fn await_index_task(&self, alias: &str) {
-        if let Some((_, (handle, token))) = self.index_tasks.remove(alias) {
-            token.cancel();
-            // Bounded cooperative join. We deliberately do NOT abort the task
-            // on timeout. An indexing task can be parked inside `build_index`'s
-            // synchronous arroy HNSW build, which runs on a `spawn_blocking`
-            // thread and has no cancellation point Tokio can interrupt.
-            // Aborting the OUTER `JoinHandle` would only detach that blocking
-            // task (it keeps its own `Arc<RwLock<VectorStore>>` clone, so the
-            // LMDB mmap stays open regardless) AND drop the post-build
-            // continuation — including the self-cleanup that deletes the
-            // orphaned `.codesearch.db` dir once the build finishes. So on
-            // timeout we detach the outer task ON PURPOSE: its post-build guard
-            // (`remove_orphaned_db_dir`) releases the handles and self-cleans
-            // the directory. The deadline-bounded delete retry in `remove_repo`
-            // covers builds that finish within its budget; a serve restart reaps
-            // anything left over.
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(crate::constants::BG_TASK_COOPERATIVE_TIMEOUT_SECS),
-                handle,
-            )
-            .await
-            {
-                Ok(Ok(())) => {
-                    tracing::debug!("Index task for '{}' exited cleanly", alias);
-                }
-                Ok(Err(join_err)) => {
-                    tracing::warn!(
-                        "Index task for '{}' panicked during shutdown: {}",
-                        alias,
-                        join_err
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "Index task for '{}' still in an uninterruptible build_index after {}s; \
-                         detaching — its post-build guard will self-clean the DB dir",
-                        alias,
-                        crate::constants::BG_TASK_COOPERATIVE_TIMEOUT_SECS,
-                    );
-                }
+    /// Cancels the task's token first (so an in-flight embed pass aborts at
+    /// the next batch/phase boundary), then waits up to the cooperative
+    /// budget for its exit. Returns `true` when the task exited within the
+    /// budget, `false` when it is still running (typically parked inside the
+    /// uninterruptible `build_index`).
+    ///
+    /// The entry is never lost: on timeout the still-pending handle goes back
+    /// into [`Self::index_tasks`]. The old code removed the entry before
+    /// waiting and dropped the handle on timeout, so a detached task held its
+    /// `Arc<SharedStores>` (and the process-wide job permit) invisibly for the
+    /// process lifetime — the leak class this tracking exists to prevent. Keeping
+    /// the handle tracked lets [`Self::sweep_index_tasks`] reap it and clean
+    /// up a removed repo's DB directory once it finally exits.
+    async fn await_index_task(&self, alias: &str) -> bool {
+        self.await_index_task_with_budget(
+            alias,
+            std::time::Duration::from_secs(crate::constants::BG_TASK_COOPERATIVE_TIMEOUT_SECS),
+        )
+        .await
+    }
+
+    /// [`Self::await_index_task`] with an injectable budget (tests use a short
+    /// one; production passes `BG_TASK_COOPERATIVE_TIMEOUT_SECS`).
+    async fn await_index_task_with_budget(&self, alias: &str, budget: Duration) -> bool {
+        let Some((_, task)) = self.index_tasks.remove(alias) else {
+            return true;
+        };
+        task.token.cancel();
+        let IndexTask {
+            mut handle,
+            token,
+            db_path,
+            started_at,
+        } = task;
+        // Bounded cooperative wait; never abort. An indexing task can be
+        // parked inside `build_index`'s synchronous arroy HNSW build, which
+        // runs on a `spawn_blocking` thread and has no cancellation point
+        // Tokio can interrupt. Aborting the OUTER `JoinHandle` would only
+        // detach that blocking task (it keeps its own
+        // `Arc<RwLock<VectorStore>>` clone, so the LMDB mmap stays open
+        // regardless) AND drop the post-build continuation — including the
+        // self-cleanup that deletes the orphaned `.codesearch.db` dir once the
+        // build finishes.
+        match tokio::time::timeout(budget, &mut handle).await {
+            Ok(Ok(())) => {
+                tracing::debug!("Index task for '{}' exited cleanly", alias);
+                true
+            }
+            Ok(Err(join_err)) => {
+                tracing::warn!(
+                    "Index task for '{}' panicked during shutdown: {}",
+                    alias,
+                    join_err
+                );
+                true
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "Index task for '{}' did not exit within {}s; keeping it tracked — the \
+                     stale-task sweeper will reap it and clean up its DB dir once it exits",
+                    alias,
+                    budget.as_secs()
+                );
+                // `timeout(&mut handle)` leaves the handle owned; put it back
+                // so the task can never become invisible.
+                self.index_tasks.insert(
+                    alias.to_string(),
+                    IndexTask {
+                        handle,
+                        token,
+                        db_path,
+                        started_at,
+                    },
+                );
+                false
             }
         }
     }
@@ -2412,8 +2641,8 @@ impl ServeState {
             .unwrap_or(true);
         if registered {
             tracing::info!(
-                "Task for '{}' was cancelled but the repo is still registered — keeping its DB \
-                 dir (handles released)",
+                "Index task for '{}' ended but the repo is still registered — keeping its DB \
+                 dir",
                 alias
             );
             return;
@@ -3689,16 +3918,17 @@ impl ServeState {
     /// closed. Naming the holders turns a two-day silent failure into one
     /// warning line.
     ///
-    /// Gated on a still-running index task: the reaper only evicts repos that
-    /// are not indexing, so a live task here means its marker was already
-    /// evicted as stale — the leak signature. Without that gate the warning
-    /// would fire on every eviction, because a just-cancelled FSW drains
-    /// asynchronously and still holds the env for a moment.
+    /// Gated on a still-running index task: the idle reaper evicts repos only
+    /// when they are not indexing, so a live task at eviction time means its
+    /// marker is missing or was dropped by another flow (e.g. a stale
+    /// non-Reindex marker) — the leak/teardown signature. Without that gate
+    /// the warning would fire on every eviction, because a just-cancelled FSW
+    /// drains asynchronously and still holds the env for a moment.
     fn warn_if_still_held(&self, alias: &str) {
         let leaked_task = self
             .index_tasks
             .get(alias)
-            .is_some_and(|entry| !entry.value().0.is_finished());
+            .is_some_and(|entry| !entry.value().handle.is_finished());
         if !leaked_task {
             return;
         }
@@ -4731,6 +4961,9 @@ async fn reindex_handler(
 
         let g_alias = guard_alias.clone();
         let g_state = guard_state.clone();
+        // The task closure moves `db_path`; keep a copy for the tracked entry
+        // so a removed repo's DB dir can be cleaned up after the task exits.
+        let task_db_path = db_path.clone();
         let handle = tokio::spawn(async move {
             tracing::info!(
                 "Force reindex for '{}': clearing stores and reindexing",
@@ -4796,9 +5029,15 @@ async fn reindex_handler(
 
             g_state.end_indexing(&g_alias, IndexingOwner::Reindex);
         });
-        state
-            .index_tasks
-            .insert(alias.to_string(), (handle, reindex_token));
+        state.index_tasks.insert(
+            alias.to_string(),
+            IndexTask {
+                handle,
+                token: reindex_token,
+                db_path: task_db_path,
+                started_at: Instant::now(),
+            },
+        );
     } else {
         // Incremental refresh: ensure the repo is opened, then refresh
         let stores = match state.get_or_open_stores(&alias, true).await {
@@ -4822,6 +5061,9 @@ async fn reindex_handler(
 
         let g_alias = guard_alias.clone();
         let g_state = guard_state.clone();
+        // The task closure moves `db_path`; keep a copy for the tracked entry
+        // so a removed repo's DB dir can be cleaned up after the task exits.
+        let task_db_path = db_path.clone();
         let handle = tokio::spawn(async move {
             tracing::info!(
                 "🔄 Incremental reindex triggered for '{}' via HTTP API",
@@ -4869,9 +5111,15 @@ async fn reindex_handler(
 
             g_state.end_indexing(&g_alias, IndexingOwner::Reindex);
         });
-        state
-            .index_tasks
-            .insert(alias.to_string(), (handle, reindex_token));
+        state.index_tasks.insert(
+            alias.to_string(),
+            IndexTask {
+                handle,
+                token: reindex_token,
+                db_path: task_db_path,
+                started_at: Instant::now(),
+            },
+        );
     }
 
     (
@@ -5139,6 +5387,9 @@ async fn add_repo_handler(
     // indexing task, so cancelling it (stop_fsw) did nothing and the task ran
     // the full embed pass to completion on a removed alias.
     let token_for_task = cancel_token.clone();
+    // The task closure moves `db_path`; keep a copy for the tracked entry so a
+    // removed repo's DB dir can be cleaned up after the task exits.
+    let task_db_path = db_path.clone();
 
     let index_handle = tokio::spawn(async move {
         tracing::info!(
@@ -5208,8 +5459,22 @@ async fn add_repo_handler(
 
         // Build vector index from freshly indexed data.
         // build_index() is CPU-heavy — offload to the blocking pool, under the
-        // same process-wide job permit as every other heavy pass.
-        let _job_permit = stores.acquire_job_permit().await;
+        // same process-wide job permit as every other heavy pass. The wait is
+        // cancellation-aware: a repo removed while queued behind another build
+        // must not keep its stores (and a queue position) parked.
+        let _job_permit = match stores.acquire_job_permit_or_cancel(&token_for_task).await {
+            JobAcquire::Ready(permit) => permit,
+            JobAcquire::Cancelled => {
+                state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
+                return;
+            }
+        };
+        // Re-check liveness after the wait: a removal that landed while the
+        // task was parked must not resurrect the alias's vector index.
+        if !state_bg.is_alias_live(&alias_bg, &token_for_task) {
+            state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
+            return;
+        }
         {
             let vector_store = Arc::clone(&stores.vector_store);
             let alias_bi = alias_bg.clone();
@@ -5263,10 +5528,17 @@ async fn add_repo_handler(
 
     // Register the indexing task so remove_repo can cancel + await it (BUG1).
     // Storing the token alongside the handle means remove_repo can cancel
-    // regardless of the repo's RepoState variant.
-    state
-        .index_tasks
-        .insert(alias.clone(), (index_handle, cancel_token));
+    // regardless of the repo's RepoState variant. The DB path travels with
+    // the entry for deferred cleanup if the repo is removed mid-index.
+    state.index_tasks.insert(
+        alias.clone(),
+        IndexTask {
+            handle: index_handle,
+            token: cancel_token,
+            db_path: task_db_path,
+            started_at: Instant::now(),
+        },
+    );
 
     (
         StatusCode::ACCEPTED,
@@ -6270,6 +6542,7 @@ pub async fn run_serve(
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {
                         reaper_state.evict_idle_repos();
+                        reaper_state.sweep_index_tasks();
                         // Dashboard refresh handled by TUI auto-refresh (TTY) or not needed (non-TTY)
                     }
                     _ = reaper_cancel.cancelled() => {

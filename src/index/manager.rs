@@ -230,6 +230,31 @@ impl SharedStores {
         }
     }
 
+    /// Cancellation-aware variant of [`Self::acquire_job_permit`].
+    ///
+    /// Returns [`crate::limits::JobAcquire::Cancelled`] when `cancel_token`
+    /// fires (or already fired) before a slot is granted, so the caller can
+    /// abort the job promptly and release its stores instead of parking on
+    /// the gate for the permit holder's whole run.
+    pub async fn acquire_job_permit_or_cancel(
+        &self,
+        cancel_token: &CancellationToken,
+    ) -> crate::limits::JobAcquire {
+        match self.job_gate.as_ref() {
+            Some(gate) => match gate.acquire_or_cancel(cancel_token).await {
+                Some(permit) => crate::limits::JobAcquire::Ready(Some(permit)),
+                None => crate::limits::JobAcquire::Cancelled,
+            },
+            None => {
+                if cancel_token.is_cancelled() {
+                    crate::limits::JobAcquire::Cancelled
+                } else {
+                    crate::limits::JobAcquire::Ready(None)
+                }
+            }
+        }
+    }
+
     /// Create new shared stores from the database path (read-write mode).
     ///
     /// This acquires a writer lock. If another process already has the lock,
@@ -646,7 +671,14 @@ impl IndexManager {
         // (when one is attached): the permit is held across the file walk, the
         // chunk/embed batches and the final HNSW build, so at most
         // `CODESEARCH_INDEX_JOBS` repos do this at once. Queries never take it.
-        let _job_permit = stores.acquire_job_permit().await;
+        // Cancellation-aware: a queued job that was cancelled aborts here and
+        // drops its stores instead of parking for the holder's whole run.
+        let _job_permit = match stores.acquire_job_permit_or_cancel(cancel_token).await {
+            crate::limits::JobAcquire::Ready(permit) => permit,
+            crate::limits::JobAcquire::Cancelled => {
+                return Err(anyhow::anyhow!("indexing cancelled"));
+            }
+        };
         Self::perform_incremental_refresh_inner(
             codebase_path,
             db_path,
@@ -1179,8 +1211,18 @@ impl IndexManager {
         // Hold the process-wide heavy-job gate across the destructive clear AND
         // the full reindex. The nested call goes to the gate-free inner body so
         // the permit is not re-acquired (which would deadlock under
-        // `CODESEARCH_INDEX_JOBS=1`).
-        let _job_permit = stores.acquire_job_permit().await;
+        // `CODESEARCH_INDEX_JOBS=1`). The wait is cancellation-aware so a repo
+        // removed while queued aborts before the destructive clear.
+        let _job_permit = match stores.acquire_job_permit_or_cancel(cancel_token).await {
+            crate::limits::JobAcquire::Ready(permit) => permit,
+            crate::limits::JobAcquire::Cancelled => {
+                return Err(anyhow::anyhow!("indexing cancelled"));
+            }
+        };
+        // Re-check after the (possibly long) wait: a cancellation that landed
+        // while queued must not start the clear, and the stores are still
+        // intact at this point.
+        Self::ensure_indexing_active(cancel_token)?;
 
         // ── Step 0: Read and preserve metadata BEFORE clearing anything ──
         // This is defensive: the DB may be incomplete (no metadata.json at all),
@@ -2090,7 +2132,12 @@ impl IndexManager {
         // One permit for the whole watcher batch: a batch can hold hundreds of
         // files, each re-embedded and followed by an HNSW rebuild, and every
         // repo's watcher would otherwise run one at the same time.
-        let _job_permit = stores.acquire_job_permit().await;
+        let _job_permit = match stores.acquire_job_permit_or_cancel(cancel_token).await {
+            crate::limits::JobAcquire::Ready(permit) => permit,
+            crate::limits::JobAcquire::Cancelled => {
+                return Err(anyhow::anyhow!("indexing cancelled"));
+            }
+        };
 
         // Enable quiet mode during FSW batch processing to suppress verbose embedding output
         set_quiet(true);
@@ -2254,7 +2301,12 @@ impl IndexManager {
         Self::ensure_indexing_active(cancel_token)?;
 
         // One permit for the whole branch-refresh pass (walk, delete, re-index).
-        let _job_permit = stores.acquire_job_permit().await;
+        let _job_permit = match stores.acquire_job_permit_or_cancel(cancel_token).await {
+            crate::limits::JobAcquire::Ready(permit) => permit,
+            crate::limits::JobAcquire::Cancelled => {
+                return Err(anyhow::anyhow!("indexing cancelled"));
+            }
+        };
 
         let result: Result<()> = async {
             // Phase 1: Discover current files on disk.
@@ -2909,6 +2961,48 @@ mod tests {
         let temp = tempdir().unwrap();
         let stores = create_test_stores(&temp.path().join("db"), 4).await;
         assert!(stores.acquire_job_permit().await.is_none());
+    }
+
+    /// Cancellation-aware acquisition: ungated stores must distinguish
+    /// "proceed without a gate" from "cancelled", and a waiter cancelled while
+    /// the only slot is held must abort promptly instead of parking.
+    #[tokio::test]
+    async fn acquire_job_permit_or_cancel_distinguishes_cancel_from_ungated() {
+        let temp = tempdir().unwrap();
+        let stores = create_test_stores(&temp.path().join("db"), 4).await;
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            stores.acquire_job_permit_or_cancel(&cancelled).await,
+            crate::limits::JobAcquire::Cancelled
+        ));
+        assert!(matches!(
+            stores
+                .acquire_job_permit_or_cancel(&CancellationToken::new())
+                .await,
+            crate::limits::JobAcquire::Ready(None)
+        ));
+
+        // Gated: a waiter cancelled while the only slot is held aborts.
+        let gate = crate::limits::JobGate::with_config(1, 0);
+        let gated = Arc::new(
+            create_test_stores(&temp.path().join("db2"), 4)
+                .await
+                .with_job_gate(Arc::clone(&gate)),
+        );
+        let held = gate.acquire().await;
+        let waiter = CancellationToken::new();
+        let canceller = waiter.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            canceller.cancel();
+        });
+        assert!(matches!(
+            gated.acquire_job_permit_or_cancel(&waiter).await,
+            crate::limits::JobAcquire::Cancelled
+        ));
+        drop(held);
     }
 
     /// A gated refresh must (a) wait while the only slot is held and (b)

@@ -7,7 +7,7 @@
 
 use std::io;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use super::tui_common::{
     self, KeyAction, OverlayKeyAction, OverlayState, RemoteIndexStats, RemoteStatsState, RepoRow,
 };
-use super::{IndexingOwner, ServeState};
+use super::{IndexTask, IndexingOwner, ServeState};
 use crate::cli::doctor;
 use crate::constants::{DB_DIR_NAME, LANG_CSHARP, LANG_TYPESCRIPT};
 use crate::index::IndexManager;
@@ -1165,6 +1165,9 @@ pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> Rei
     // `index_tasks` so `remove_repo` can cancel + await it (BUG1).
     let reindex_token = CancellationToken::new();
     let reindex_token_task = reindex_token.clone();
+    // The task closure moves `db_path`; keep a copy for the tracked entry so a
+    // removed repo's DB dir can be cleaned up after the task exits.
+    let task_db_path = db_path.clone();
     let handle = tokio::spawn(async move {
         tracing::info!(
             "TUI: Force reindex for '{}': clearing stores and reindexing",
@@ -1224,7 +1227,15 @@ pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> Rei
         // Remove guard
         state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
     });
-    state.index_tasks.insert(alias, (handle, reindex_token));
+    state.index_tasks.insert(
+        alias,
+        IndexTask {
+            handle,
+            token: reindex_token,
+            db_path: task_db_path,
+            started_at: Instant::now(),
+        },
+    );
 
     ReindexLaunch::Started
 }

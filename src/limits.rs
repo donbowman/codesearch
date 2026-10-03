@@ -29,6 +29,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 /// Max concurrent heavy repo jobs in this process (>= 1).
 pub const INDEX_JOBS_ENV: &str = "CODESEARCH_INDEX_JOBS";
@@ -154,14 +155,37 @@ impl JobGate {
 
     /// Acquire one job slot, then (when enabled) wait, bounded, for the free
     /// memory floor. The caller holds the returned permit for the whole job.
+    ///
+    /// Prefer [`Self::acquire_or_cancel`] for jobs that carry a cancellation
+    /// token; this variant waits unbounded because there is nothing to cancel
+    /// it with.
     pub async fn acquire(&self) -> JobPermit {
-        let wait_start = Instant::now();
-        let permit = self
-            .permits
-            .clone()
-            .acquire_owned()
+        self.acquire_or_cancel(&CancellationToken::new())
             .await
-            .expect("job gate semaphore is never closed");
+            .expect("a never-cancelled token can never abort the acquire")
+    }
+
+    /// Acquire one job slot, aborting promptly when `cancel` fires while
+    /// queued.
+    ///
+    /// Returns `None` without consuming a slot when the token was already
+    /// cancelled or fires before a slot is granted. A job cancelled while
+    /// queued must abort rather than park: parking kept a removed or cancelled
+    /// job's `Arc<SharedStores>` (and its LMDB env) alive for the permit
+    /// holder's whole run, leaving "locked by another process" / double-open
+    /// failures behind with nothing left to release them.
+    pub async fn acquire_or_cancel(&self, cancel: &CancellationToken) -> Option<JobPermit> {
+        let wait_start = Instant::now();
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let permit = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return None,
+            permit = self.permits.clone().acquire_owned() => {
+                permit.expect("job gate semaphore is never closed")
+            }
+        };
         let waited = wait_start.elapsed();
         if waited >= SLOW_ACQUIRE_LOG_AFTER {
             tracing::info!(
@@ -173,7 +197,12 @@ impl JobGate {
         if self.min_free_mb > 0 {
             self.wait_for_memory().await;
         }
-        JobPermit { _permit: permit }
+        // The memory wait above is bounded; a cancellation that lands during
+        // it still wins — release the slot rather than start cancelled work.
+        if cancel.is_cancelled() {
+            return None;
+        }
+        Some(JobPermit { _permit: permit })
     }
 
     async fn wait_for_memory(&self) {
@@ -212,6 +241,22 @@ impl JobGate {
 #[derive(Debug)]
 pub struct JobPermit {
     _permit: OwnedSemaphorePermit,
+}
+
+/// Cancellation-aware acquisition outcome for a heavy job.
+///
+/// `#[must_use]`: dropping a [`Self::Ready`] value releases the job slot
+/// immediately (the job would run ungated), and ignoring [`Self::Cancelled`]
+/// means starting work that was already cancelled. Always match on it.
+#[derive(Debug)]
+#[must_use]
+pub enum JobAcquire {
+    /// The job may proceed. The permit is `None` when no gate is attached
+    /// (standalone processes keep their previous unbounded behaviour).
+    Ready(Option<JobPermit>),
+    /// The cancellation token fired before a slot was granted; no slot was
+    /// consumed and the job must abort promptly, dropping its stores.
+    Cancelled,
 }
 
 #[cfg(test)]

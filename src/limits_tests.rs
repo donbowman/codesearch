@@ -123,3 +123,56 @@ async fn memory_wait_is_bounded() {
     assert!(start.elapsed() >= Duration::from_millis(50));
     drop(permit);
 }
+
+#[tokio::test]
+async fn cancelled_gate_waiter_aborts_without_consuming_a_slot() {
+    // Regression: a reindex queued behind a long-running job parked on the
+    // gate holding its store handles. A cancellation while queued must abort
+    // the wait promptly and leave the slot untouched.
+    let gate = JobGate::with_config(1, 0);
+    let held = gate.acquire().await;
+    let token = CancellationToken::new();
+    let canceller = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        canceller.cancel();
+    });
+
+    let start = Instant::now();
+    let outcome = gate.acquire_or_cancel(&token).await;
+    assert!(
+        outcome.is_none(),
+        "a cancelled waiter must not receive a permit"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "cancellation must abort the wait promptly"
+    );
+
+    drop(held);
+    // The slot is still free: the cancelled wait never consumed it.
+    assert!(gate
+        .acquire_or_cancel(&CancellationToken::new())
+        .await
+        .is_some());
+}
+
+#[tokio::test]
+async fn pre_cancelled_token_never_takes_a_slot() {
+    let gate = JobGate::with_config(1, 0);
+    let token = CancellationToken::new();
+    token.cancel();
+    assert!(gate.acquire_or_cancel(&token).await.is_none());
+    assert!(gate
+        .acquire_or_cancel(&CancellationToken::new())
+        .await
+        .is_some());
+}
+
+#[tokio::test]
+async fn uncancelled_token_proceeds_through_the_gate() {
+    let gate = JobGate::with_config(2, 0);
+    let token = CancellationToken::new();
+    assert!(gate.acquire_or_cancel(&token).await.is_some());
+    assert!(gate.acquire_or_cancel(&token).await.is_some());
+}

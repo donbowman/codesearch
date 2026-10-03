@@ -504,14 +504,17 @@ pub const REMOTE_ROW_REFRESH_SECS: u64 = 5;
 /// cancellation between insert and remove silently leaks the entry, leaving
 /// the TUI stuck on "Indexing" forever.
 ///
-/// Rather than chase every leak path, entries older than this threshold are
+/// Rather than chase every leak path, a marker older than this threshold is
 /// treated as absent by all read sites (`repo_statuses_lightweight`,
-/// `evict_idle_repos`, and the reindex 409 guard) and lazily evicted. This
-/// makes the system self-healing regardless of the leak cause.
+/// `evict_idle_repos`, and the reindex 409 guard) and lazily evicted — but
+/// only when no tracked indexing task for the alias is still alive. A live
+/// task (queued on the job gate, or in a long uninterruptible build) renews
+/// its marker instead, so a backlog drains rather than being cancelled as
+/// "leaked"; the system stays self-healing for genuinely dead tasks without
+/// killing slow ones.
 ///
 /// 30 minutes is deliberately generous: a force reindex of a very large repo
 /// or a full scip-csharp solution rebuild can legitimately take many minutes.
-/// Any session stuck beyond that is almost certainly leaked.
 /// Override with `CODESEARCH_MAX_INDEXING_SECS`.
 pub const MAX_INDEXING_SECS: u64 = 30 * 60; // 30 minutes
 
