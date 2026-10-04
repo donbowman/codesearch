@@ -528,7 +528,7 @@ pub enum Commands {
 
     /// Download embedding models
     Setup {
-        /// Model to download (defaults to mxbai-embed-xsmall-v1)
+        /// Model to download (defaults to minilm-l6-q)
         #[arg(long)]
         model: Option<String>,
     },
@@ -1005,19 +1005,28 @@ fn warn_if_heavier_model(model_type: ModelType) {
     }
 }
 
+/// Resolve a CLI `--model` flag to an optional [`ModelType`].
+///
+/// `None` (flag absent) stays `None` so runtime paths keep their per-query
+/// model resolution; an unknown name is rejected with the full valid-model
+/// list. Shared by every command that takes `--model`.
+pub(crate) fn parse_model_arg(model: Option<&str>) -> Result<Option<ModelType>> {
+    match model {
+        Some(name) => ModelType::parse(name).map(Some).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unknown model '{name}' (valid models: {})",
+                ModelType::valid_short_names()
+            )
+        }),
+        None => Ok(None),
+    }
+}
+
 pub async fn run(cancel_token: CancellationToken) -> Result<()> {
     let cli = Cli::parse();
 
     // Parse model from CLI flag
-    let model_type = cli.model.as_ref().and_then(|m| ModelType::parse(m));
-    if cli.model.is_some() && model_type.is_none() {
-        eprintln!(
-            "Unknown model: '{}'. Available models:",
-            cli.model.as_deref().unwrap_or_default()
-        );
-        eprintln!("  {}", ModelType::valid_short_names());
-        std::process::exit(1);
-    }
+    let model_type = parse_model_arg(cli.model.as_deref())?;
 
     // Set quiet mode if requested
     if cli.quiet {
@@ -1107,18 +1116,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                         if let Some(peer_name) = &remote {
                             run_remote_add(peer_name, add_path).await
                         } else {
-                            let mt = model
-                                .as_deref()
-                                .and_then(|m| {
-                                    let parsed = ModelType::parse(m);
-                                    if parsed.is_none() {
-                                        eprintln!("Unknown model: '{}'. Available models:", m);
-                                        eprintln!("  {}", ModelType::valid_short_names());
-                                        std::process::exit(1);
-                                    }
-                                    parsed
-                                })
-                                .or(model_type);
+                            let mt = parse_model_arg(model.as_deref())?.or(model_type);
                             if let Some(mt) = mt {
                                 warn_if_heavier_model(mt);
                             }
@@ -1821,8 +1819,9 @@ fn codesearch_hook_block() -> String {
 # Only react to branch/worktree checkouts ($3 = 1). `git worktree add` fires
 # post-checkout with flag 1; a file checkout (`git checkout -- path`) fires with
 # flag 0 and must not re-register (it changes no repo location, just wastes a POST).
-if [ "$3" = "1" ] && [ -f "$HOME/.codesearch/serve_url" ]; then
-    __cs_url=$(cat "$HOME/.codesearch/serve_url")
+__cs_home="${CODESEARCH_HOME:-$HOME/.codesearch}"
+if [ "$3" = "1" ] && [ -f "$__cs_home/serve_url" ]; then
+    __cs_url=$(cat "$__cs_home/serve_url")
     if [ -n "$__cs_url" ]; then
         # Git Bash `pwd` yields an msys path (/c/...) that codesearch serve
         # cannot canonicalize (HTTP 400); `pwd -W` yields a native C:/ path.
@@ -2056,6 +2055,21 @@ mod tests {
         assert!(
             block.contains("[ \"$3\" = \"1\" ]"),
             "hook must gate on the branch-checkout flag"
+        );
+    }
+
+    #[test]
+    fn test_hook_block_resolves_serve_url_via_codesearch_home() {
+        let block = codesearch_hook_block();
+        // serve_url lives under the relocatable global root: the hook must
+        // fall back through CODESEARCH_HOME, mirroring codesearch_home().
+        assert!(
+            block.contains("${CODESEARCH_HOME:-$HOME/.codesearch}"),
+            "hook must honour CODESEARCH_HOME before ~/.codesearch"
+        );
+        assert!(
+            !block.contains("$HOME/.codesearch/serve_url"),
+            "no direct ~/.codesearch/serve_url path may remain"
         );
     }
 

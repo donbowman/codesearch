@@ -93,14 +93,36 @@ fn dedupe_references(
     out
 }
 
+/// What find_impact actually did (or could not do) about a missing symbol
+/// index — drives the wording of [`missing_index_warning`] so the answer
+/// never claims a rebuild that is not running.
+pub(crate) enum SymbolIndexHeal {
+    /// Serve mode with a routed alias: the self-heal task was spawned.
+    BackgroundStarted,
+    /// No serve / no routed alias: nothing runs automatically; the caller
+    /// must build the index explicitly.
+    Manual,
+    /// The indexer does not apply to this repository (e.g. no top-level
+    /// tsconfig.json for TypeScript) — no rebuild can ever start here.
+    NotApplicable(&'static str),
+}
+
 /// Caller-facing warning for a find_impact answer against a project whose
 /// symbol index was never built. The empty reference list such an answer
 /// carries means UNKNOWN — stamping this on the payload is what keeps it from
-/// passing for "no callers" while the self-heal rebuild runs.
-pub(crate) fn missing_index_warning(lang: &str) -> String {
-    format!(
-        "No {lang} symbol index exists for this project — an empty reference list means UNKNOWN, not 'no references'. A background rebuild was started; retry this call once it completes."
-    )
+/// passing for "no callers" while the status says what will actually happen.
+pub(crate) fn missing_index_warning(lang: &str, heal: SymbolIndexHeal) -> String {
+    match heal {
+        SymbolIndexHeal::BackgroundStarted => format!(
+            "No {lang} symbol index exists for this project — an empty reference list means UNKNOWN, not 'no references'. A background rebuild was started; retry this call once it completes."
+        ),
+        SymbolIndexHeal::Manual => format!(
+            "No {lang} symbol index exists for this project — an empty reference list means UNKNOWN, not 'no references'. Background rebuilds only run in serve mode; build it with `codesearch index symbol <alias>` and retry."
+        ),
+        SymbolIndexHeal::NotApplicable(reason) => format!(
+            "No {lang} symbol index exists for this project and none can be built automatically ({reason}) — an empty reference list means UNKNOWN, not 'no references'."
+        ),
+    }
 }
 
 #[tool_router(router = find_impact_router, vis = "pub(crate)")]
@@ -270,13 +292,27 @@ impl CodesearchService {
         // warnings channel. Drift (index_head_sha vs current) is
         // deliberately NOT healed — reindexing on every branch switch would
         // thrash (see `SymbolIndexer::index_head_sha`).
+        //
+        // The warning wording follows the real status: a repo the indexer
+        // does not apply to (no top-level tsconfig.json / no .sln) can never
+        // get a rebuilt index, so saying "a rebuild was started" there was a
+        // promise nothing would fulfil.
         let index_missing = !indexer.has_index(&db_path);
+        let mut heal_spawned = false;
         let heal_warning: Vec<String> = if index_missing {
-            vec![missing_index_warning(indexer.language())]
+            let heal = if !indexer.applies_to(&project_root) {
+                SymbolIndexHeal::NotApplicable(indexer.applicability_hint())
+            } else if self.serve_state.is_some() && ctx.project_alias.is_some() {
+                heal_spawned = true;
+                SymbolIndexHeal::BackgroundStarted
+            } else {
+                SymbolIndexHeal::Manual
+            };
+            vec![missing_index_warning(indexer.language(), heal)]
         } else {
             Vec::new()
         };
-        if index_missing {
+        if heal_spawned {
             if let (Some(ref serve_state), Some(ref alias)) =
                 (&self.serve_state, &ctx.project_alias)
             {

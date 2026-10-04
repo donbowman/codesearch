@@ -319,6 +319,27 @@ impl FastEmbedder {
         model_type: ModelType,
         cache_dir: Option<&std::path::Path>,
     ) -> Result<Self> {
+        Self::init(model_type, cache_dir, false)
+    }
+
+    /// Create a new embedder with the fastembed download progress bar visible.
+    ///
+    /// Only `codesearch setup` wants this: it downloads hundreds of MB on
+    /// purpose, and a silent run looks like a hang. Runtime paths keep the
+    /// bar off so it does not corrupt TUI/serve output.
+    pub fn with_cache_dir_progress(
+        model_type: ModelType,
+        cache_dir: Option<&std::path::Path>,
+        show_download_progress: bool,
+    ) -> Result<Self> {
+        Self::init(model_type, cache_dir, show_download_progress)
+    }
+
+    fn init(
+        model_type: ModelType,
+        cache_dir: Option<&std::path::Path>,
+        show_download_progress: bool,
+    ) -> Result<Self> {
         // Set cache directory via environment variable if provided
         // Note: fastembed library uses FASTEMBED_CACHE_DIR (not FASTEMBED_CACHE_PATH)
         if let Some(cache_dir) = cache_dir {
@@ -333,7 +354,7 @@ impl FastEmbedder {
         let cpu_ep = CPU::default().with_arena_allocator(true).build();
 
         let options = TextInitOptions::new(model_type.to_fastembed_model())
-            .with_show_download_progress(false)
+            .with_show_download_progress(show_download_progress)
             .with_execution_providers(vec![cpu_ep]);
 
         // Cap ONNX intra-op threads when CODESEARCH_EMBED_THREADS is set.

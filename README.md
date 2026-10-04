@@ -255,7 +255,7 @@ The native command embeds the hook scripts in the binary (no source tree needed)
 
 **OpenCode** gets the same structural treatment through the OpenCode v2 plugin in [`integrations/opencode/`](integrations/opencode/README.md): it resolves the session directory to an indexed project, injects scope-aware guidance once per session, rescues empty greps with index hits, optionally prunes or blocks `grep`/`glob`, keeps the serve hub healthy (with optional auto-start), and adds `/codesearch*` commands, a `codesearch_scope` tool, a skill and compaction assistance. Install by copying `codesearch.ts` into `~/.config/opencode/plugins/` — see the [integration README](integrations/opencode/README.md).
 
-Note: the grep-guard detects "codesearch is available **for this repo**" via that repo's registration with the serve hub (`~/.codesearch/repos.json`, honoring the `CODESEARCH_REPOS_CONFIG` override) or `CODESEARCH_SERVER` — **not** by checking whether a `codesearch` process is running (that runs almost constantly as a multi-repo hub and would false-fire in every directory), and **not** via a local `.codesearch.db` directory (a stale db from a since-unregistered repo used to deny Grep even though the hub could not answer for it). For a remote-serve setup with no local registration, set `CODESEARCH_SERVER` to opt back into enforcement.
+Note: the grep-guard detects "codesearch is available **for this repo**" via that repo's registration with the serve hub (`~/.codesearch/repos.json`, honoring the `CODESEARCH_REPOS_CONFIG` / `CODESEARCH_HOME` overrides) or `CODESEARCH_SERVER` — **not** by checking whether a `codesearch` process is running (that runs almost constantly as a multi-repo hub and would false-fire in every directory), and **not** via a local `.codesearch.db` directory (a stale db from a since-unregistered repo used to deny Grep even though the hub could not answer for it). For a remote-serve setup with no local registration, set `CODESEARCH_SERVER` to opt back into enforcement.
 
 ## MCP Tools Reference
 
@@ -446,12 +446,12 @@ When using `git worktree add` to create parallel working directories, codesearch
 codesearch hooks git install
 ```
 
-This installs a `post-checkout` hook that POSTs the worktree path to the running serve instance whenever a new worktree is checked out. The hook reads the serve URL from `~/.codesearch/serve_url` (automatically managed by `codesearch serve`).
+This installs a `post-checkout` hook that POSTs the worktree path to the running serve instance whenever a new worktree is checked out. The hook reads the serve URL from `~/.codesearch/serve_url` (`$CODESEARCH_HOME/serve_url` when the global root is relocated; automatically managed by `codesearch serve`).
 
 The install target is resolved with `git rev-parse --git-path hooks`, so it honours `core.hooksPath` (and, inside a linked worktree, the shared common-dir hooks) rather than assuming `.git/hooks/`. An existing `post-checkout` is not overwritten — codesearch's logic is chained in as a marker-delimited block.
 
 **How it works:**
-1. `codesearch serve` writes its URL to `~/.codesearch/serve_url` on startup (deletes on shutdown)
+1. `codesearch serve` writes its URL to `~/.codesearch/serve_url` (`$CODESEARCH_HOME/serve_url` when relocated) on startup (deletes on shutdown)
 2. The `post-checkout` hook reads that file and POSTs the working directory to `POST /repos`
 3. Serve registers the worktree path and begins indexing (deduped — won't re-register existing paths)
 
@@ -575,6 +575,7 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `CODESEARCH_ALLOWED_HOSTS` | Comma-separated hostname allowlist for the MCP streamable-HTTP transport (unset = loopback only: `localhost`, `127.0.0.1`, `::1`). Set this to your container/service hostname when serve runs behind a container network or reverse proxy — see [Security](#security). |
 | `CODESEARCH_DISABLE_HOST_VALIDATION` | `1`/`true` disables the MCP transport's Host-header allowlist entirely (DNS-rebinding protection off). Only safe behind a reverse proxy/firewall that already restricts inbound Host headers — see [Security](#security). |
 | `CODESEARCH_MCP_MODE` | MCP mode: auto, client, local |
+| `CODESEARCH_HOME` | Relocate the entire global root (`repos.json`, models cache, logs, `serve_url`, global ignore/extension files) away from `~/.codesearch`. Must be an absolute path; unset = `~/.codesearch`. Per-file overrides like `CODESEARCH_REPOS_CONFIG` still win |
 | `CODESEARCH_REPOS_CONFIG` | Path to repos.json |
 | `CODESEARCH_REPO_IDLE_TIMEOUT_SECS` | Idle eviction timeout (default: 1800) |
 | `CODESEARCH_CACHE_MAX_MEMORY` | Embedding cache MB (default: 500) |

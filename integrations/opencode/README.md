@@ -41,7 +41,7 @@ preference into behaviour:
 
 | Feature | Default | What it does |
 |---|---|---|
-| **Scope resolution** | on | Maps the session directory to a registered project alias (and its groups), from `~/.codesearch/repos.json` or a live `status` snapshot. |
+| **Scope resolution** | on | Maps the session directory to a registered project alias (and its groups), from `~/.codesearch/repos.json` (relocatable via `CODESEARCH_HOME`) or a live `status` snapshot. |
 | **Scope-aware guidance** | once per session | Injects a compact strategy block plus the resolved scope into system context, so the first tool call already knows `project=`. |
 | **Zero-hit rescue** | on | When `grep`/`glob` returns nothing in an indexed repo, runs a literal codesearch query and appends the index hits to the tool result. |
 | **Code-search-first guards** | `nudge` | `off`, `nudge` (one tip per session), `prune` (hide `grep`/`glob` from the model), or `block` (deny with the exact codesearch call to use). |
@@ -148,7 +148,8 @@ Precedence, lowest to highest:
   "token": "{env:CODESEARCH_API_KEY}",
   // Name of the MCP server entry in opencode.jsonc to mirror.
   "mcpServer": "codesearch",
-  // Optional override for ~/.codesearch/repos.json.
+  // Optional override for the registry (default: ~/.codesearch/repos.json,
+  // relocated wholesale by CODESEARCH_HOME).
   "reposConfig": "",
   "debug": false,
 
@@ -212,7 +213,7 @@ Precedence, lowest to highest:
 | `CODESEARCH_SERVER` | – | Serve **base** URL (e.g. `http://127.0.0.1:39725`), same meaning as the Claude Code guard hooks use. `/mcp` is appended. |
 | `CODESEARCH_API_KEY` | – | Bearer token for an authenticated/remote serve. |
 | `CODESEARCH_CONFIG` | `~/.config/opencode/codesearch.json` | Config file path. |
-| `CODESEARCH_REPOS_CONFIG` | `~/.codesearch/repos.json` | Registry path (shared with the hub and the Claude Code hooks). |
+| `CODESEARCH_REPOS_CONFIG` | `$CODESEARCH_HOME/repos.json` (`~/.codesearch` when unset) | Registry path (shared with the hub and the Claude Code hooks). |
 | `CODESEARCH_MCP_SERVER` | `codesearch` | MCP entry name to mirror for URL/token. |
 | `CODESEARCH_PLUGIN_GUARDS` | `nudge` | `off` / `nudge` / `prune` / `block`. |
 | `CODESEARCH_PLUGIN_SCOPE` | `session` | `session` / `message` / `off`. |
@@ -237,7 +238,7 @@ The plugin resolves the MCP endpoint in this order, first non-empty wins:
 2. `CODESEARCH_SERVER`
 3. the `url` of the MCP entry named by `mcpServer` in `opencode.jsonc`
    (its `Authorization` header is used as the token, minus `Bearer`)
-4. `~/.codesearch/serve_url` (written by `codesearch serve`)
+4. `~/.codesearch/serve_url`, or `$CODESEARCH_HOME/serve_url` when the global root is relocated (written by `codesearch serve`)
 5. `http://127.0.0.1:39725/mcp`
 
 A base URL without `/mcp` is normalised by appending it, so pointing
@@ -424,7 +425,7 @@ hub uses.
   (`~/.local/share/opencode/log/opencode.log`).
 - **No scope / `project=null`** — the directory is not registered. `/codesearch-index`
   runs `codesearch index`; verify with `codesearch index list` and inspect
-  `~/.codesearch/repos.json` (or your `CODESEARCH_REPOS_CONFIG`).
+  `~/.codesearch/repos.json` (or your `CODESEARCH_REPOS_CONFIG`; `CODESEARCH_HOME` relocates the default).
 - **Rescue never fires** — check `guards.rescue`, `guards.tools`, and health
   (`/codesearch-status`). Rescue is skipped while the hub is down.
 - **Block mode too strict** — `guards.mode: "nudge"` (or `prune`) is the

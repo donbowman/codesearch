@@ -76,7 +76,10 @@ pub struct FindImpactResult {
     /// answer is as complete as the index knows.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
-    /// Seconds since the symbol index was last rebuilt.
+    /// Seconds since the symbol index was last rebuilt. `u64::MAX` is the
+    /// internal "age unknown" sentinel `index_age` returns when the index
+    /// cannot be opened or read; over the wire it serializes as null.
+    #[serde(serialize_with = "serialize_index_age")]
     pub index_age_seconds: u64,
     /// Language that produced this result.
     pub language: String,
@@ -93,6 +96,20 @@ pub struct FindImpactResult {
     /// never fail the response).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_head_sha: Option<String>,
+}
+
+/// Serialize `index_age_seconds`, mapping the internal unknown-age sentinel
+/// (`u64::MAX`) to JSON null — a consumer must not see
+/// `18446744073709551615` and mistake it for an age. Real ages stay numbers.
+fn serialize_index_age<S>(age: &u64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if *age == u64::MAX {
+        serializer.serialize_none()
+    } else {
+        serializer.serialize_u64(*age)
+    }
 }
 
 /// A `find_impact` query in the form the adapters resolve it.
@@ -504,6 +521,14 @@ pub trait SymbolIndexer: Send + Sync {
     /// a cheap, deterministic applicability test.
     fn applies_to(&self, _repo_path: &Path) -> bool {
         true
+    }
+
+    /// Why `applies_to` would refuse a repository, in one clause. Surfaced
+    /// by find_impact's missing-index warning so a repo that can never get
+    /// a symbol index says so — instead of promising a rebuild that will
+    /// not happen. Adapters override next to their `applies_to`.
+    fn applicability_hint(&self) -> &'static str {
+        "the repository has no entrypoint this symbol indexer recognizes"
     }
 
     /// Downcast to `Any` for concrete-type method access (e.g. `prewarm_ref_cache`).

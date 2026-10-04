@@ -59,18 +59,50 @@ pub const DEFAULT_LOG_MAX_FILES: usize = 5;
 /// Default log retention period in days
 pub const DEFAULT_LOG_RETENTION_DAYS: u64 = 5;
 
-/// Get the global models cache directory (~/.codesearch/models/).
+/// Environment variable relocating the entire global codesearch root.
+///
+/// When set to a non-empty absolute path, every global artifact — repos.json,
+/// the embedding-models cache, serve logs, serve_url, the global
+/// .codesearchignore and extensions.json — resolves under it instead of
+/// `~/.codesearch`. This is the single knob for machines that keep large
+/// artifacts off the home directory. Per-file overrides such as
+/// [`REPOS_CONFIG_ENV`] and [`EXTENSION_MAP_ENV`] still win when set.
+pub const CODESEARCH_HOME_ENV: &str = "CODESEARCH_HOME";
+
+/// Resolve the global codesearch root directory.
+///
+/// Returns `$CODESEARCH_HOME` when set and non-empty (it must be absolute — a
+/// relative value would silently resolve against the current working
+/// directory and fragment state between runs), otherwise `~/.codesearch`.
+/// All global-path accessors derive from this single point, so one hook
+/// relocates everything.
+pub fn codesearch_home() -> anyhow::Result<PathBuf> {
+    if let Ok(dir) = std::env::var(CODESEARCH_HOME_ENV) {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            let path = PathBuf::from(dir);
+            if !path.is_absolute() {
+                anyhow::bail!(
+                    "{} must be an absolute path, got: {}",
+                    CODESEARCH_HOME_ENV,
+                    dir
+                );
+            }
+            return Ok(path);
+        }
+    }
+    dirs::home_dir()
+        .map(|home| home.join(CONFIG_DIR_NAME))
+        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))
+}
+
+/// Get the global models cache directory (`<codesearch_home>/models/`).
 ///
 /// This centralizes embedding model downloads so they are shared across all
-/// databases instead of being duplicated per-project. The directory is created
-/// if it does not exist.
-///
-/// Falls back to a temp directory if the home directory cannot be determined.
+/// databases instead of being duplicated per-project. Relocated wholesale via
+/// [`CODESEARCH_HOME_ENV`]. The directory is created if it does not exist.
 pub fn get_global_models_cache_dir() -> anyhow::Result<PathBuf> {
-    let base =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-
-    let models_dir = base.join(CONFIG_DIR_NAME).join(MODELS_SUBDIR);
+    let models_dir = codesearch_home()?.join(MODELS_SUBDIR);
 
     if !models_dir.exists() {
         std::fs::create_dir_all(&models_dir).map_err(|e| {
@@ -85,13 +117,17 @@ pub fn get_global_models_cache_dir() -> anyhow::Result<PathBuf> {
     Ok(models_dir)
 }
 
-/// Get the global cache directory (~/.codesearch/).
+/// Get the global cache directory (`<codesearch_home>/`).
 ///
 /// Used for client/auto mode logging when no local DB is available.
-/// The directory is created if it does not exist.
+/// Relocated wholesale via [`CODESEARCH_HOME_ENV`]. The directory is created
+/// if it does not exist.
 pub fn get_global_cache_dir() -> PathBuf {
-    let base = dirs::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let cache_dir = base.join(CONFIG_DIR_NAME);
+    let cache_dir = codesearch_home().unwrap_or_else(|_| {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(CONFIG_DIR_NAME)
+    });
     if !cache_dir.exists() {
         let _ = std::fs::create_dir_all(&cache_dir);
     }
@@ -101,18 +137,19 @@ pub fn get_global_cache_dir() -> PathBuf {
 /// Name of the global codesearchignore file in ~/.codesearch/
 pub const GLOBAL_CODESEARCHIGNORE_FILE: &str = ".codesearchignore";
 
-/// Get the path to the global .codesearchignore file (~/.codesearch/.codesearchignore).
+/// Get the path to the global .codesearchignore file
+/// (`<codesearch_home>/.codesearchignore`).
 ///
 /// This file uses the same gitignore syntax and is applied to all indexed repos,
 /// providing a way to set ignore rules without modifying repo-local files.
 /// Repo-local `.codesearchignore` and `.gitignore` take precedence.
+/// Relocated wholesale via [`CODESEARCH_HOME_ENV`].
 ///
-/// Returns `None` only if the home directory cannot be determined.
+/// Returns `None` only if the root cannot be resolved.
 pub fn global_codesearchignore_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| {
-        home.join(CONFIG_DIR_NAME)
-            .join(GLOBAL_CODESEARCHIGNORE_FILE)
-    })
+    codesearch_home()
+        .ok()
+        .map(|root| root.join(GLOBAL_CODESEARCHIGNORE_FILE))
 }
 
 /// Name of the global extension→language map file in ~/.codesearch/
@@ -132,15 +169,17 @@ pub const EXTENSION_MAP_ENV: &str = "CODESEARCH_EXTENSION_MAP";
 /// the binary. User overrides take precedence over the built-in extension table.
 ///
 /// The path resolves to `$CODESEARCH_EXTENSION_MAP` when set and non-empty,
-/// otherwise `~/.codesearch/extensions.json`. Returns `None` only when neither
-/// the env var nor the home directory is available.
+/// otherwise `<codesearch_home>/extensions.json`. Returns `None` only when
+/// neither the env var nor a resolvable root is available.
 pub fn global_extension_map_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var(EXTENSION_MAP_ENV) {
         if !p.is_empty() {
             return Some(PathBuf::from(p));
         }
     }
-    dirs::home_dir().map(|home| home.join(CONFIG_DIR_NAME).join(GLOBAL_EXTENSION_MAP_FILE))
+    codesearch_home()
+        .ok()
+        .map(|root| root.join(GLOBAL_EXTENSION_MAP_FILE))
 }
 
 /// Name of the repos configuration file
@@ -911,8 +950,12 @@ pub const ALWAYS_SKIP_FILENAME_SUFFIXES: &[&str] = &[
     ".orig",
 ];
 
-/// Directories and files that should always be excluded from indexing
-/// These are added to both .gitignore and .codesearchignore automatically
+/// Directories and files that should always be excluded from indexing.
+///
+/// This list is applied purely in memory: the file walker filters these names
+/// during traversal and the watcher skips paths containing them. Nothing is
+/// written to `.gitignore` or `.codesearchignore`, and previously indexed
+/// content keeps appearing in search results until the next reindex.
 pub const ALWAYS_EXCLUDED: &[&str] = &[
     // Codesearch databases
     ".codesearch",
@@ -950,6 +993,26 @@ pub const ALWAYS_EXCLUDED: &[&str] = &[
     "coverage",
     ".nyc_output",
     ".cache",
+    // Dependency lock files — generated by package managers, never source.
+    // Matched by exact filename so the walker and watcher exclude them even
+    // when the extension alone is not skipped (pnpm-lock.yaml,
+    // package-lock.json, npm-shrinkwrap.json, bun.lockb).
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "bun.lockb",
+    "deno.lock",
+    "Cargo.lock",
+    "go.sum",
+    "poetry.lock",
+    "Pipfile.lock",
+    "uv.lock",
+    "pdm.lock",
+    "composer.lock",
+    "Gemfile.lock",
+    "flake.lock",
 ];
 
 #[cfg(test)]
@@ -982,6 +1045,98 @@ mod tests {
             path.file_name().unwrap(),
             GLOBAL_CODESEARCHIGNORE_FILE,
             "Filename should match GLOBAL_CODESEARCHIGNORE_FILE constant"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codesearch_home_relocates_all_global_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        // A developer machine with either per-file override exported would
+        // otherwise win over CODESEARCH_HOME and fail this test spuriously.
+        let _clear_specific =
+            crate::testing::EnvRestore::remove(&[REPOS_CONFIG_ENV, EXTENSION_MAP_ENV]);
+        let _set =
+            crate::testing::EnvRestore::set(&[(CODESEARCH_HOME_ENV, root.to_str().unwrap())]);
+
+        assert_eq!(codesearch_home().unwrap(), root);
+        assert_eq!(
+            get_global_models_cache_dir().unwrap(),
+            root.join(MODELS_SUBDIR),
+            "models cache must live under CODESEARCH_HOME"
+        );
+        assert!(root.join(MODELS_SUBDIR).exists());
+        assert_eq!(get_global_cache_dir(), root);
+        assert_eq!(
+            global_codesearchignore_path(),
+            Some(root.join(GLOBAL_CODESEARCHIGNORE_FILE))
+        );
+        assert_eq!(
+            global_extension_map_path(),
+            Some(root.join(GLOBAL_EXTENSION_MAP_FILE))
+        );
+        assert_eq!(
+            crate::db_discovery::repos::config_path().unwrap(),
+            root.join(REPOS_CONFIG_FILE),
+            "repos.json default must follow CODESEARCH_HOME"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn relative_codesearch_home_is_rejected() {
+        let _set = crate::testing::EnvRestore::set(&[(CODESEARCH_HOME_ENV, "relative/dir")]);
+
+        let err = codesearch_home().unwrap_err();
+        assert!(
+            err.to_string().contains("absolute"),
+            "error must mention the absolute-path requirement, got: {err}"
+        );
+        assert!(
+            get_global_models_cache_dir().is_err(),
+            "a bad root must not silently fall back to the default models dir"
+        );
+        assert_eq!(
+            global_codesearchignore_path(),
+            None,
+            "a bad root must not silently resolve the global ignore file"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn empty_or_unset_codesearch_home_falls_back_to_default() {
+        let expected = dirs::home_dir().unwrap().join(CONFIG_DIR_NAME);
+
+        let _empty = crate::testing::EnvRestore::set(&[(CODESEARCH_HOME_ENV, "")]);
+        assert_eq!(
+            codesearch_home().unwrap(),
+            expected,
+            "an empty override must fall back to ~/.codesearch"
+        );
+
+        let _unset = crate::testing::EnvRestore::remove(&[CODESEARCH_HOME_ENV]);
+        assert_eq!(codesearch_home().unwrap(), expected);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn specific_overrides_win_over_codesearch_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let map_path = tmp.path().join("my-extensions.json");
+        let repos_path = tmp.path().join("my-repos.json");
+        let _set = crate::testing::EnvRestore::set(&[
+            (CODESEARCH_HOME_ENV, tmp.path().to_str().unwrap()),
+            (EXTENSION_MAP_ENV, map_path.to_str().unwrap()),
+            (REPOS_CONFIG_ENV, repos_path.to_str().unwrap()),
+        ]);
+
+        assert_eq!(global_extension_map_path(), Some(map_path));
+        assert_eq!(
+            crate::db_discovery::repos::config_path().unwrap(),
+            repos_path,
+            "CODESEARCH_REPOS_CONFIG must win over CODESEARCH_HOME"
         );
     }
 }

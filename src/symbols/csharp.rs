@@ -2083,6 +2083,10 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         Self::find_solution(repo_path).is_some()
     }
 
+    fn applicability_hint(&self) -> &'static str {
+        "the scip-csharp adapter requires a .sln file in the repository root"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

@@ -565,6 +565,140 @@ fn test_relative_path_empty_alias() {
     assert_eq!(result, "docs/guide.md");
 }
 
+// === group fan-out alias attribution (semantic_search_multi) ===
+
+#[tokio::test]
+async fn group_lexical_search_attributes_each_hit_to_its_repo() {
+    use rmcp::model::ContentBlock;
+
+    // Two repos with disjoint chunk ids. A group query must answer with
+    // alias-prefixed paths ("alpha/…", "beta/…") exactly like a project=
+    // query — before the fix the fan-out lost the store of origin and both
+    // hits came back bare, making a cross-repo response unattributable.
+    let root_a = tempfile::tempdir().expect("tempdir a");
+    let stores_a = std::sync::Arc::new(
+        crate::index::SharedStores::new(&root_a.path().join(".codesearch.db"), 2)
+            .expect("stores a"),
+    );
+    {
+        let mut vs = stores_a.vector_store.write().await;
+        let chunk = crate::chunker::Chunk::new(
+            "fn gadget() {}".to_string(),
+            0,
+            0,
+            crate::chunker::ChunkKind::Function,
+            "src/lib.rs".to_string(),
+        );
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            chunk,
+            vec![0.0, 1.0],
+        )])
+        .expect("insert chunk a");
+        vs.build_index().expect("build index a");
+    }
+    {
+        let mut fts = stores_a.fts_store.write().await;
+        fts.add_chunk(0, "fn gadget() {}", "src/lib.rs", None, "Function")
+            .expect("fts doc a");
+        fts.commit().expect("commit a");
+    }
+
+    let root_b = tempfile::tempdir().expect("tempdir b");
+    let stores_b = std::sync::Arc::new(
+        crate::index::SharedStores::new(&root_b.path().join(".codesearch.db"), 2)
+            .expect("stores b"),
+    );
+    {
+        // insert_chunks assigns ids from 0 per store, so a filler chunk keeps
+        // the real one at id 1 and the two test repos never share a chunk id.
+        let mut vs = stores_b.vector_store.write().await;
+        let filler = crate::chunker::Chunk::new(
+            "filler".to_string(),
+            0,
+            0,
+            crate::chunker::ChunkKind::Function,
+            "src/filler.rs".to_string(),
+        );
+        let chunk = crate::chunker::Chunk::new(
+            "gadget helper".to_string(),
+            0,
+            0,
+            crate::chunker::ChunkKind::Function,
+            "src/util.rs".to_string(),
+        );
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            filler,
+            vec![0.5, 0.5],
+        )])
+        .expect("insert filler b");
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            chunk,
+            vec![1.0, 0.0],
+        )])
+        .expect("insert chunk b");
+        vs.build_index().expect("build index b");
+    }
+    {
+        let mut fts = stores_b.fts_store.write().await;
+        fts.add_chunk(1, "gadget helper", "src/util.rs", None, "Function")
+            .expect("fts doc b");
+        fts.commit().expect("commit b");
+    }
+
+    let service = super::CodesearchService::new_with_stores(
+        Some(root_a.path().to_path_buf()),
+        Some(stores_a.clone()),
+    )
+    .expect("service");
+
+    let request = super::SemanticSearchRequest {
+        query: "gadget".to_string(),
+        limit: Some(10),
+        compact: Some(false),
+        filter_path: None,
+        mode: Some("lexical".to_string()),
+        project: None,
+        group: Some("all".to_string()),
+    };
+    let mut alias_roots = std::collections::HashMap::new();
+    alias_roots.insert(
+        "alpha".to_string(),
+        crate::cache::normalize_path_str(&root_a.path().to_string_lossy()),
+    );
+    alias_roots.insert(
+        "beta".to_string(),
+        crate::cache::normalize_path_str(&root_b.path().to_string_lossy()),
+    );
+
+    let result = service
+        .semantic_search_multi(
+            &request,
+            &[],
+            10,
+            false,
+            vec![stores_a.clone(), stores_b.clone()],
+            &["alpha".to_string(), "beta".to_string()],
+            &alias_roots,
+        )
+        .await
+        .expect("group search must succeed");
+
+    let json = match &result.content[0] {
+        ContentBlock::Text(t) => t.text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json response");
+    let paths: Vec<&str> = parsed["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .map(|r| r["path"].as_str().expect("path string"))
+        .collect();
+    assert_eq!(paths.len(), 2, "both repos must answer, paths: {paths:?}");
+    assert!(paths.contains(&"alpha/src/lib.rs"), "paths: {paths:?}");
+    assert!(paths.contains(&"beta/src/util.rs"), "paths: {paths:?}");
+}
+
 #[test]
 fn test_normalize_tool_path_relativizes_absolute() {
     let root = std::path::Path::new("/tmp/proj");

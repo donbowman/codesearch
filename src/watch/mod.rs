@@ -702,6 +702,13 @@ mod tests {
         assert!(!watcher.is_watchable(Path::new("/tmp/image.png")));
         assert!(!watcher.is_watchable(Path::new("/tmp/data.bin")));
 
+        // Should NOT watch (dependency lock files — name-based, covers names
+        // whose extension alone is indexable like .yaml/.json/.lockb)
+        assert!(!watcher.is_watchable(Path::new("/tmp/pnpm-lock.yaml")));
+        assert!(!watcher.is_watchable(Path::new("/tmp/package-lock.json")));
+        assert!(!watcher.is_watchable(Path::new("/tmp/npm-shrinkwrap.json")));
+        assert!(!watcher.is_watchable(Path::new("/tmp/bun.lockb")));
+
         // SHOULD watch (code files)
         assert!(watcher.is_watchable(Path::new("/tmp/src/main.rs")));
         assert!(watcher.is_watchable(Path::new("/tmp/src/lib.ts")));

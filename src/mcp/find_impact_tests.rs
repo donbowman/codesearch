@@ -9,7 +9,7 @@
 
 use super::{
     find_impact_with_budget, missing_index_warning, resolve_find_impact_budget_secs,
-    ImpactLookupOutcome,
+    ImpactLookupOutcome, SymbolIndexHeal,
 };
 use crate::constants::{DEFAULT_FIND_IMPACT_BUDGET_SECS, FIND_IMPACT_BUDGET_SECS_ENV};
 use crate::symbols::{SymbolLookupBusy, SymbolReference};
@@ -284,6 +284,36 @@ fn fingerprint_fields_present_when_set_and_omitted_when_none() {
     assert!(!keys.contains(&"index_head_sha"), "keys: {keys:?}");
     assert!(!keys.contains(&"current_head_sha"), "keys: {keys:?}");
     assert!(!keys.contains(&"resolved_symbol"), "keys: {keys:?}");
+}
+
+#[test]
+fn index_age_sentinel_serializes_as_null_and_real_ages_as_numbers() {
+    use crate::symbols::{FindImpactResult, SymbolReference};
+
+    let result = |age: u64| FindImpactResult {
+        symbol: "FieldDefinition.Validate".to_string(),
+        resolved_symbol: None,
+        references: vec![SymbolReference {
+            file: PathBuf::from("a.cs"),
+            start_line: 1,
+            end_line: 1,
+            kind: "definition".to_string(),
+        }],
+        warnings: Vec::new(),
+        index_age_seconds: age,
+        language: "csharp".to_string(),
+        scope: "project:p".to_string(),
+        index_head_sha: None,
+        current_head_sha: None,
+    };
+
+    // u64::MAX is `index_age`'s unreadable-index sentinel; a consumer must
+    // see "unknown" (null), not 18446744073709551615 seconds.
+    let unknown: serde_json::Value = serde_json::to_value(result(u64::MAX)).unwrap();
+    assert_eq!(unknown["index_age_seconds"], serde_json::Value::Null);
+
+    let known: serde_json::Value = serde_json::to_value(result(12)).unwrap();
+    assert_eq!(known["index_age_seconds"], serde_json::json!(12));
 }
 
 #[test]
@@ -834,12 +864,13 @@ async fn clean_resolved_answer_omits_the_warnings_field() {
 }
 
 /// The missing-index warning is what keeps a never-built symbol index's
-/// empty reference list from passing for "no callers": it must name the
-/// language, state UNKNOWN explicitly, and tell the caller to retry after
-/// the background rebuild.
+/// empty reference list from passing for "no callers": whatever the heal
+/// status, it must name the language and state UNKNOWN explicitly. The
+/// wording per status must also stay honest — "a background rebuild was
+/// started" is only allowed when one actually was.
 #[test]
 fn missing_index_warning_names_language_and_marks_answer_unknown() {
-    let warning = missing_index_warning("csharp");
+    let warning = missing_index_warning("csharp", SymbolIndexHeal::BackgroundStarted);
     assert!(
         warning.contains("csharp"),
         "must name the language, got: {warning}"
@@ -851,6 +882,35 @@ fn missing_index_warning_names_language_and_marks_answer_unknown() {
     assert!(
         warning.contains("retry"),
         "must tell the caller to retry after the rebuild, got: {warning}"
+    );
+}
+
+#[test]
+fn missing_index_warning_manual_names_the_build_command() {
+    let warning = missing_index_warning("typescript", SymbolIndexHeal::Manual);
+    assert!(warning.contains("UNKNOWN"), "got: {warning}");
+    assert!(
+        warning.contains("codesearch index symbol"),
+        "must tell the caller how to build the index, got: {warning}"
+    );
+    assert!(
+        !warning.contains("rebuild was started"),
+        "nothing was started — must not claim it, got: {warning}"
+    );
+}
+
+#[test]
+fn missing_index_warning_not_applicable_explains_why_and_promises_nothing() {
+    let reason = "the scip-typescript adapter requires a top-level tsconfig.json (monorepo layouts are not resolved yet)";
+    let warning = missing_index_warning("typescript", SymbolIndexHeal::NotApplicable(reason));
+    assert!(warning.contains("UNKNOWN"), "got: {warning}");
+    assert!(
+        warning.contains("tsconfig.json"),
+        "must surface the indexer's own reason, got: {warning}"
+    );
+    assert!(
+        !warning.contains("rebuild was started"),
+        "a non-applicable repo can never be rebuilt here — must not claim a rebuild, got: {warning}"
     );
 }
 

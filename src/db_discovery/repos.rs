@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::cache::{normalize_user_path, safe_canonicalize, strip_unc_prefix};
-use crate::constants::{CONFIG_DIR_NAME, REPOS_CONFIG_FILE};
+use crate::constants::REPOS_CONFIG_FILE;
 
 /// A remote `codesearch serve` peer that can be queried for federation.
 ///
@@ -1147,8 +1147,7 @@ impl ReposConfig {
 }
 
 pub fn config_dir() -> Result<PathBuf> {
-    let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory found"))?;
-    Ok(home_dir.join(CONFIG_DIR_NAME))
+    crate::constants::codesearch_home()
 }
 
 pub fn config_path() -> Result<PathBuf> {

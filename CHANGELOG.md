@@ -14,7 +14,13 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
-## [1.5.1]
+## [1.5.1] - 2026-10-04
+
+### Added
+
+- **`codesearch setup` — download embedding models, and a relocatable global root via `CODESEARCH_HOME`.** The stubbed setup command now resolves `--model` through the shared model parser (unknown names error with the valid list), downloads into the global models cache with a visible progress bar (runtime paths stay silent), and probe-embeds one query so a broken download fails in setup instead of mid-indexing. `CODESEARCH_HOME` relocates the entire global root (repos.json, models cache, logs, serve_url, global ignore/extensions) and is honoured by the hub, db-discovery, every Claude Code guard hook and the OpenCode plugin, with tests pinning each layer. *(Contributed by @belovaf in #298 — in the same PR: find-impact warnings that no longer promise rebuilds nothing will run, group-fan-out hits attributed to their repo, and dependency-lockfile indexing exclusions.)*
+
+*A big thank-you to belovaf ([@belovaf](https://github.com/belovaf)) for his first contribution to this release — a careful, well-tested feature plus four quality fixes landed in one go.*
 
 ### Fixed
 
@@ -359,6 +365,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 ## [1.0.72] - 2026-05-01
 - Initial multi-repo release: multi-repo `serve` (HTTP/SSE, per-project/group routing, RRF cross-repo search), stdio MCP proxy with client-side auto-reconnect, tree-sitter chunking (9 langs), persistent SHA-256 embedding cache, repository groups, re-tuned RRF, and LMDB resize crash fix (#30, `MDB_MAP_FULL`).
+
+[1.5.1]: https://github.com/flupkede/codesearch/compare/v1.5.0...v1.5.1
 
 [1.5.0]: https://github.com/flupkede/codesearch/compare/v1.4.9...v1.5.0
 

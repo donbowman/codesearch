@@ -499,6 +499,14 @@ impl CodesearchService {
         let mode = request.mode.as_deref().unwrap_or("auto");
         let structural_intent = detect_structural_intent(&request.query);
 
+        // Which repo (alias) owns each surviving chunk id, recorded at
+        // fan-out and chunk-resolution time. The flat fan-out merge drops the
+        // store of origin, so without this map a group=all response cannot
+        // attribute a hit to its repo — `project=` results are prefixed
+        // "alias/path", group results must be too.
+        let mut alias_by_chunk: std::collections::HashMap<u32, String> =
+            std::collections::HashMap::new();
+
         // === Lexical mode: FTS only across all stores ===
         if mode == "lexical" {
             // Lexical has no second backend, so a failed store here is invisible
@@ -545,22 +553,22 @@ impl CodesearchService {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
 
-            let results = self
+            let mut results = self
                 .resolve_fts_to_search_results_multi(
                     &all_fts,
                     limit,
                     &stores,
                     aliases,
                     &mut lexical_warnings,
+                    &mut alias_by_chunk,
                 )
                 .await;
+            prefix_paths_with_alias(&mut results, &alias_by_chunk, alias_roots);
 
             if let Some(target_kind) = structural_intent {
-                // We need mutable results but we have them as vectordb::SearchResult
-                let mut mutable_results = results;
-                boost_kind(&mut mutable_results, target_kind);
+                boost_kind(&mut results, target_kind);
                 return self.build_semantic_response(
-                    mutable_results,
+                    results,
                     request,
                     compact,
                     !identifiers.is_empty(),
@@ -643,9 +651,13 @@ impl CodesearchService {
                             "internal error: no query embedding resolved for repo '{alias}'"
                         )
                     })?;
-                    store
+                    let found = store
                         .search(embedding, limit * 5)
-                        .context("Error searching vector store")
+                        .context("Error searching vector store")?;
+                    for r in &found {
+                        alias_by_chunk.insert(r.id, alias.to_string());
+                    }
+                    Ok(found)
                 },
                 stores.clone(),
                 aliases,
@@ -714,6 +726,7 @@ impl CodesearchService {
                     results.push(r);
                 }
             }
+            prefix_paths_with_alias(&mut results, &alias_by_chunk, alias_roots);
             return self.build_semantic_response(
                 results,
                 request,
@@ -807,6 +820,7 @@ impl CodesearchService {
                         &stores,
                         aliases,
                         &mut search_warnings,
+                        &mut alias_by_chunk,
                     )
                     .await
                 {
@@ -820,6 +834,8 @@ impl CodesearchService {
             boost_kind(&mut mapped, target_kind);
         }
 
+        prefix_paths_with_alias(&mut mapped, &alias_by_chunk, alias_roots);
+
         self.build_semantic_response(
             mapped,
             request,
@@ -832,6 +848,7 @@ impl CodesearchService {
     }
 
     /// Resolve a single chunk from multiple stores (used for FTS-only hits in multi-store fusion).
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_chunk_from_stores(
         &self,
         chunk_id: u32,
@@ -839,6 +856,7 @@ impl CodesearchService {
         stores: &[Arc<SharedStores>],
         aliases: &[String],
         warnings: &mut Vec<String>,
+        alias_by_chunk: &mut std::collections::HashMap<u32, String>,
     ) -> Option<crate::vectordb::SearchResult> {
         for (idx, store_arc) in stores.iter().enumerate() {
             let store = match bounded_vector_read(&store_arc.vector_store).await {
@@ -853,6 +871,12 @@ impl CodesearchService {
                 note_store_failure(warnings, aliases, idx, "chunk lookup", e);
             }
             if let Ok(Some(chunk)) = looked_up {
+                // Record the owning alias with the content actually chosen:
+                // path attribution below must match this very chunk, and the
+                // probe order here is what decided it.
+                if let Some(alias) = aliases.get(idx) {
+                    alias_by_chunk.insert(chunk_id, alias.clone());
+                }
                 return Some(crate::vectordb::SearchResult {
                     id: chunk_id,
                     content: chunk.content,
@@ -875,6 +899,7 @@ impl CodesearchService {
     }
 
     /// Resolve FTS results to SearchResult using multiple stores.
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_fts_to_search_results_multi(
         &self,
         fts_results: &[crate::fts::FtsResult],
@@ -882,6 +907,7 @@ impl CodesearchService {
         stores: &[Arc<SharedStores>],
         aliases: &[String],
         warnings: &mut Vec<String>,
+        alias_by_chunk: &mut std::collections::HashMap<u32, String>,
     ) -> Vec<crate::vectordb::SearchResult> {
         let mut results = Vec::new();
         for fts in fts_results.iter().take(limit) {
@@ -903,6 +929,11 @@ impl CodesearchService {
                     note_store_failure(warnings, aliases, idx, "chunk lookup", e);
                 }
                 if let Ok(Some(chunk)) = looked_up {
+                    // Same as resolve_chunk_from_stores: attribute the alias of
+                    // the store this content was actually read from.
+                    if let Some(alias) = aliases.get(idx) {
+                        alias_by_chunk.insert(fts.chunk_id, alias.clone());
+                    }
                     results.push(crate::vectordb::SearchResult {
                         id: fts.chunk_id,
                         content: chunk.content,
@@ -1090,7 +1121,10 @@ impl CodesearchService {
             })
             .collect();
 
-        // Prefix paths with alias for multi-repo / single-project identification
+        // `project=` routing prefixes paths with the routed alias here. Group
+        // fan-out results arrive already alias-prefixed (semantic_search_multi
+        // recorded each chunk's repo), so this pass only normalizes them;
+        // stdio without alias roots passes paths through untouched.
         for item in &mut items {
             if let Some(alias) = project_alias {
                 if let Some(root) = alias_roots.get(alias) {
@@ -1099,7 +1133,7 @@ impl CodesearchService {
                     item.path = crate::cache::normalize_path_str(&item.path);
                 }
             } else if !alias_roots.is_empty() {
-                item.path = prefix_path_multi(&item.path, &[], alias_roots);
+                item.path = crate::cache::normalize_path_str(&item.path);
             }
         }
 
@@ -1172,6 +1206,27 @@ impl CodesearchService {
                 }
                 Vec::new()
             }
+        }
+    }
+}
+
+/// Prefix group-fan-out result paths with the repo alias each chunk was
+/// recorded from, mirroring the `project=` routing ("alias/repo-relative").
+///
+/// Results whose alias was not recorded (every survivor is recorded at
+/// fan-out or resolution time, so this indicates an internal slip) keep their
+/// raw path — `build_semantic_response` still normalizes it.
+fn prefix_paths_with_alias(
+    results: &mut [crate::vectordb::SearchResult],
+    alias_by_chunk: &std::collections::HashMap<u32, String>,
+    alias_roots: &std::collections::HashMap<String, String>,
+) {
+    for r in results.iter_mut() {
+        let Some(alias) = alias_by_chunk.get(&r.id) else {
+            continue;
+        };
+        if let Some(root) = alias_roots.get(alias) {
+            r.path = prefix_path_with_alias(&r.path, Some(alias), root);
         }
     }
 }

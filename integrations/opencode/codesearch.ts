@@ -333,6 +333,11 @@ function configDir(): string {
   return process.env.XDG_CONFIG_HOME || `${homeDir()}/.config`
 }
 
+/** Global codesearch root: $CODESEARCH_HOME, else ~/.codesearch (mirrors constants.rs `codesearch_home()`). */
+function codesearchHome(): string {
+  return process.env.CODESEARCH_HOME || `${homeDir()}/.codesearch`
+}
+
 /**
  * Strip `//` and block comments plus trailing commas from JSONC, honouring
  * string literals. Enough for OpenCode's config files.
@@ -541,7 +546,7 @@ function normalizeMcpUrl(value: string): string {
 /** Resolve the serve URL: config/env > CODESEARCH_SERVER > MCP entry > serve_url file > default. */
 function resolveServeUrl(settings: CodeSearchSettings): string {
   const mcpEntry = readMcpEntry(settings.mcpServer)
-  const serveUrlFile = readTextFile(`${homeDir()}/.codesearch/serve_url`)?.trim() ?? ""
+  const serveUrlFile = readTextFile(`${codesearchHome()}/serve_url`)?.trim() ?? ""
   const candidates = [
     settings.url,
     process.env.CODESEARCH_SERVER ?? "",
@@ -1159,7 +1164,7 @@ export default {
     const url = resolveServeUrl(settings)
     const token = resolveToken(settings)
     const registry = new RepoRegistry(
-      settings.reposConfig || `${homeDir()}/.codesearch/repos.json`,
+      settings.reposConfig || `${codesearchHome()}/repos.json`,
     )
     registry.load()
     const status = new StatusCache()
